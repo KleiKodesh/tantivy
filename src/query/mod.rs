@@ -26,6 +26,7 @@ mod regex_query;
 mod reqopt_scorer;
 mod scorer;
 mod set_query;
+mod span_query;
 mod size_hint;
 mod term_query;
 mod union;
@@ -41,6 +42,9 @@ pub use query_grammar::Occur;
 
 pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::{AutomatonWeight, MatchedTermsSink};
+pub use self::span_query::{
+    ExactTermSource, SpanQuery, SpanTermSource, DEFAULT_SPAN_MAX_EXPANSIONS,
+};
 pub use self::bitset::BitSetDocSet;
 pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
 pub use self::boolean_query::{BooleanQuery, BooleanWeight};

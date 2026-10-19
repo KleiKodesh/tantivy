@@ -166,15 +166,32 @@ where
     }
 
     /// Returns the term infos that match the automaton
+    ///
+    /// If a [`MatchedTermsSink`] is attached, the matched terms are also
+    /// copied into it.
     pub fn get_match_term_infos(&self, reader: &SegmentReader) -> crate::Result<Vec<TermInfo>> {
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
-        let mut term_stream = self.automaton_stream(term_dict)?;
         let mut term_infos = Vec::new();
-        while term_stream.advance() {
-            term_infos.push(term_stream.value().clone());
+        if let Some(sink) = &self.matched_terms_sink {
+            let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
+            let mut matched = sink.lock();
+            while term_stream.advance() {
+                matched.insert(term_stream.key().to_vec());
+                term_infos.push(term_stream.value().clone());
+            }
+        } else {
+            let mut term_stream = self.automaton_stream(term_dict)?;
+            while term_stream.advance() {
+                term_infos.push(term_stream.value().clone());
+            }
         }
         Ok(term_infos)
+    }
+
+    /// The field this weight searches.
+    pub fn field(&self) -> Field {
+        self.field
     }
 }
 
