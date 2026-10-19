@@ -2,7 +2,7 @@ use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use once_cell::sync::OnceCell;
 use tantivy_fst::Automaton;
 
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
+use crate::query::{AutomatonWeight, EnableScoring, MatchedTermsSink, Query, Weight};
 use crate::schema::{Term, Type};
 use crate::TantivyError::InvalidArgument;
 
@@ -90,6 +90,9 @@ pub struct FuzzyTermQuery {
     transposition_cost_one: bool,
     /// is a starts with query
     prefix: bool,
+    /// When set, every term the automaton matches in the term dictionary is
+    /// copied into this sink as the search runs.
+    matched_terms_sink: Option<MatchedTermsSink>,
 }
 
 impl FuzzyTermQuery {
@@ -100,7 +103,16 @@ impl FuzzyTermQuery {
             distance,
             transposition_cost_one,
             prefix: false,
+            matched_terms_sink: None,
         }
+    }
+
+    /// Collects every term this query matches in the term dictionary into
+    /// `sink` while the search runs — the concrete words behind the fuzzy
+    /// expansion, at the cost of one copy per matched term. Without a sink
+    /// the key-less fast path is used, exactly as before.
+    pub fn set_matched_terms_sink(&mut self, sink: MatchedTermsSink) {
+        self.matched_terms_sink = Some(sink);
     }
 
     /// Creates a new Fuzzy Query of the Term prefix
@@ -110,6 +122,7 @@ impl FuzzyTermQuery {
             distance,
             transposition_cost_one,
             prefix: true,
+            matched_terms_sink: None,
         }
     }
 
@@ -181,15 +194,15 @@ impl FuzzyTermQuery {
 
     fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
         let automaton = self.automaton()?;
-        if let Some((json_path_bytes, _)) = self.term.value().as_json() {
-            Ok(AutomatonWeight::new_for_json_path(
-                self.term.field(),
-                automaton,
-                json_path_bytes,
-            ))
+        let mut weight = if let Some((json_path_bytes, _)) = self.term.value().as_json() {
+            AutomatonWeight::new_for_json_path(self.term.field(), automaton, json_path_bytes)
         } else {
-            Ok(AutomatonWeight::new(self.term.field(), automaton))
+            AutomatonWeight::new(self.term.field(), automaton)
+        };
+        if let Some(sink) = &self.matched_terms_sink {
+            weight.set_matched_terms_sink(sink.clone());
         }
+        Ok(weight)
     }
 }
 
@@ -343,6 +356,19 @@ mod test {
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             let (score, _) = top_docs[0];
             assert_nearly_equals!(1.0, score);
+        }
+
+        // with a sink attached, the search also reports the words the fuzzy
+        // expansion matched — and only those
+        {
+            let term = Term::from_field_text(country_field, "japon");
+            let mut fuzzy_query = FuzzyTermQuery::new(term, 1, true);
+            let sink = crate::query::MatchedTermsSink::new();
+            fuzzy_query.set_matched_terms_sink(sink.clone());
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(2).order_by_score())?;
+            assert_eq!(top_docs.len(), 1, "Expected only 1 document");
+            assert_eq!(sink.take_strings(), vec!["japan".to_string()]);
         }
 
         // fails because non-prefix Levenshtein distance is more than 1 (add 'a' and 'n')

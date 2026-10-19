@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tantivy_fst::Regex;
 
 use crate::error::TantivyError;
-use crate::query::{AutomatonWeight, EnableScoring, Query, Weight};
+use crate::query::{AutomatonWeight, EnableScoring, MatchedTermsSink, Query, Weight};
 use crate::schema::Field;
 
 /// A Regex Query matches all of the documents
@@ -57,6 +57,9 @@ use crate::schema::Field;
 pub struct RegexQuery {
     regex: Arc<Regex>,
     field: Field,
+    /// When set, every term the regex matches in the term dictionary is
+    /// copied into this sink as the search runs.
+    matched_terms_sink: Option<MatchedTermsSink>,
 }
 
 impl RegexQuery {
@@ -72,11 +75,24 @@ impl RegexQuery {
         RegexQuery {
             regex: regex.into(),
             field,
+            matched_terms_sink: None,
         }
     }
 
+    /// Collects every term this query matches in the term dictionary into
+    /// `sink` while the search runs — the concrete words behind the regex
+    /// expansion, at the cost of one copy per matched term. Without a sink
+    /// the key-less fast path is used, exactly as before.
+    pub fn set_matched_terms_sink(&mut self, sink: MatchedTermsSink) {
+        self.matched_terms_sink = Some(sink);
+    }
+
     fn specialized_weight(&self) -> AutomatonWeight<Regex> {
-        AutomatonWeight::new(self.field, self.regex.clone())
+        let mut weight = AutomatonWeight::new(self.field, self.regex.clone());
+        if let Some(sink) = &self.matched_terms_sink {
+            weight.set_matched_terms_sink(sink.clone());
+        }
+        weight
     }
 }
 
