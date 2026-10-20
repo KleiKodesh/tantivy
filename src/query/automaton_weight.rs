@@ -474,6 +474,38 @@ mod tests {
     }
 
     #[test]
+    fn test_automaton_weight_max_expansions_zero_width_bytes() -> crate::Result<()> {
+        // "abc" (3 chars) and "a\"bc" (4 chars, 3 with a zero-width quote) both
+        // match; cap 1 keeps the shorter, and with the quote zero-width the
+        // tie breaks on byte order ('"' < 'b')
+        let mut schema = Schema::builder();
+        let title = schema.add_text_field("title", STRING);
+        let index = Index::create_in_ram(schema.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.add_document(doc!(title=>"abc"))?;
+        index_writer.add_document(doc!(title=>"a\"bc"))?;
+        index_writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let mut automaton_weight = AutomatonWeight::new(title, PrefixedByA);
+        let sink = super::MatchedTermsSink::new();
+        automaton_weight.set_matched_terms_sink(sink.clone());
+        automaton_weight.set_max_expansions(1);
+        let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        assert_eq!(scorer.doc(), 0u32);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(sink.take_strings(), vec!["abc".to_string()]);
+
+        automaton_weight.set_zero_width_bytes(crate::termdict::ZeroWidthBytes::new(b"\""));
+        let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        assert_eq!(scorer.doc(), 1u32);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(sink.take_strings(), vec!["a\"bc".to_string()]);
+        Ok(())
+    }
+
+    #[test]
     fn test_automaton_weight_max_expansions_rank_first() -> crate::Result<()> {
         // a rank that prefers "abcd" overrides the shortest-first tie rule
         let index = create_index()?;

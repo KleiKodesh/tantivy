@@ -254,18 +254,18 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
 /// Only ASCII bytes can be zero-width: a multi-byte character is always
 /// counted as one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ZeroWidthBytes([u64; 4]);
+pub struct ZeroWidthBytes([u64; 2]);
 
 impl ZeroWidthBytes {
     /// Every byte counts.
-    pub const NONE: ZeroWidthBytes = ZeroWidthBytes([0; 4]);
+    pub const NONE: ZeroWidthBytes = ZeroWidthBytes([0; 2]);
 
     /// The given ASCII bytes are zero-width.
     ///
     /// # Panics
     /// If a byte is not ASCII.
     pub const fn new(bytes: &[u8]) -> ZeroWidthBytes {
-        let mut bits = [0u64; 4];
+        let mut bits = [0u64; 2];
         let mut i = 0;
         while i < bytes.len() {
             let byte = bytes[i];
@@ -279,12 +279,12 @@ impl ZeroWidthBytes {
     /// Whether `byte` is zero-width.
     #[inline]
     pub fn contains(&self, byte: u8) -> bool {
-        (self.0[(byte >> 6) as usize] >> (byte & 63)) & 1 == 1
+        byte.is_ascii() && (self.0[(byte >> 6) as usize] >> (byte & 63)) & 1 == 1
     }
 
     /// Whether no byte is zero-width.
     pub fn is_empty(&self) -> bool {
-        self.0 == [0; 4]
+        self.0 == [0; 2]
     }
 
     /// The length of a term in characters: UTF-8 characters, not counting

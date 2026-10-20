@@ -92,7 +92,7 @@ impl RegexQuery {
     }
 
     /// Caps the expansion at `cap` terms per segment: the shortest matches
-    /// win, then the most frequent (FtsLib's wildcard rule). Never an error.
+    /// win, then the most frequent. Never an error.
     pub fn set_max_expansions(&mut self, cap: usize) {
         self.max_expansions = Some(cap);
     }

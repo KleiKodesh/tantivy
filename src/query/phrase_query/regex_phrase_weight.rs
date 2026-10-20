@@ -70,7 +70,7 @@ impl RegexPhraseWeight {
             let mut automaton: AutomatonWeight<Regex> =
                 AutomatonWeight::new(self.field, Arc::clone(regex));
             // Cap per slot rather than fail the query: the shortest, most
-            // frequent matches are kept (FtsLib's wildcard rule).
+            // frequent matches are kept.
             automaton.set_max_expansions(self.max_expansions as usize);
             let term_infos = automaton.get_match_term_infos(reader)?;
             // If term_infos is empty, the phrase can not match any documents.

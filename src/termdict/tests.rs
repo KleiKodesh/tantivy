@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::{io, str};
 
-use super::{TermDictionary, TermDictionaryBuilder, TermStreamer};
+use super::{TermDictionary, TermDictionaryBuilder, TermStreamer, ZeroWidthBytes};
 use crate::directory::{Directory, FileSlice, RamDirectory, TerminatingWrite};
 use crate::postings::TermInfo;
 
@@ -481,4 +481,73 @@ fn test_search_without_keys() {
         assert_eq!(stream.value(), &make_term_info(term_ord));
     }
     assert!(!stream.advance());
+}
+
+#[test]
+fn test_zero_width_bytes() {
+    let none = ZeroWidthBytes::NONE;
+    assert!(none.is_empty());
+    assert!(!none.contains(b'"'));
+    assert_eq!(none.term_len("a\"b\u{e9}".as_bytes()), 4);
+
+    let quote = ZeroWidthBytes::new(b"\"'");
+    assert!(!quote.is_empty());
+    assert!(quote.contains(b'"'));
+    assert!(quote.contains(b'\''));
+    assert!(!quote.contains(b'a'));
+    assert!(!quote.contains(0xC3));
+    assert_eq!(quote.term_len("a\"b\u{e9}".as_bytes()), 3);
+    assert_eq!(quote.term_len(b""), 0);
+    assert_eq!(ZeroWidthBytes::default(), none);
+}
+
+#[test]
+fn test_search_shortest_first() -> crate::Result<()> {
+    let terms: &[&str] = &["a", "a\"b", "ab", "abc", "\u{e9}"];
+    let buffer: Vec<u8> = {
+        let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+        for (ord, term) in terms.iter().enumerate() {
+            builder.insert(term.as_bytes(), &make_term_info(ord as u64))?;
+        }
+        builder.finish()?
+    };
+    let dict = TermDictionary::open(FileSlice::from(buffer))?;
+
+    let levels = |zero_width: ZeroWidthBytes| -> io::Result<Vec<(usize, Vec<String>)>> {
+        let mut walk = dict.search_shortest_first(&tantivy_fst::automaton::AlwaysMatch, zero_width);
+        let mut levels = Vec::new();
+        while let Some((len, level)) = walk.next_level()? {
+            let keys = level
+                .into_iter()
+                .map(|(key, info)| {
+                    let term = String::from_utf8(key).unwrap();
+                    let expected = terms.iter().position(|t| *t == term).unwrap();
+                    assert_eq!(info, make_term_info(expected as u64), "term info of {term}");
+                    term
+                })
+                .collect();
+            levels.push((len, keys));
+        }
+        Ok(levels)
+    };
+
+    // every character counts: the quote makes a"b three characters long
+    assert_eq!(
+        levels(ZeroWidthBytes::NONE)?,
+        vec![
+            (1, vec!["a".to_string(), "\u{e9}".to_string()]),
+            (2, vec!["ab".to_string()]),
+            (3, vec!["a\"b".to_string(), "abc".to_string()]),
+        ]
+    );
+    // a zero-width quote: a"b is as short as ab
+    assert_eq!(
+        levels(ZeroWidthBytes::new(b"\""))?,
+        vec![
+            (1, vec!["a".to_string(), "\u{e9}".to_string()]),
+            (2, vec!["a\"b".to_string(), "ab".to_string()]),
+            (3, vec!["abc".to_string()]),
+        ]
+    );
+    Ok(())
 }
