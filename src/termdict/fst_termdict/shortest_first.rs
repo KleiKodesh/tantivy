@@ -8,15 +8,15 @@
 //! `*כי*`) is then never visited: the walk cost is bounded by the cap, not
 //! by the expansion.
 //!
-//! Length counts UTF-8 characters except `"` (the canonical intra-word quote
-//! the Hebrew tokenizer keeps): a quote is zero-width, so רש"י and רשי sit on
-//! the same level, as in FtsLib whose terms carried no quotes.
+//! Length counts UTF-8 characters. The caller may declare ASCII bytes as
+//! zero-width ([`ZeroWidthBytes`]): an intra-word mark the tokenizer keeps
+//! (an apostrophe, a quote) then does not push a term to a later level.
 
 use tantivy_fst::raw::{CompiledAddr, Fst};
 use tantivy_fst::Automaton;
 
-use crate::termdict::TermOrdinal;
 use crate::directory::OwnedBytes;
+use crate::termdict::{TermOrdinal, ZeroWidthBytes};
 
 struct Frontier<S> {
     addr: CompiledAddr,
@@ -33,6 +33,7 @@ pub type Level = Vec<(Vec<u8>, TermOrdinal)>;
 pub struct ShortestFirstWalk<'a, A: Automaton> {
     fst: &'a Fst<OwnedBytes>,
     automaton: &'a A,
+    zero_width: ZeroWidthBytes,
     frontier: Vec<Frontier<A::State>>,
     level: usize,
 }
@@ -42,7 +43,11 @@ where
     A: Automaton,
     A::State: Clone,
 {
-    pub(crate) fn new(fst: &'a Fst<OwnedBytes>, automaton: &'a A) -> Self {
+    pub(crate) fn new(
+        fst: &'a Fst<OwnedBytes>,
+        automaton: &'a A,
+        zero_width: ZeroWidthBytes,
+    ) -> Self {
         let start = automaton.start();
         let frontier = if automaton.can_match(&start) {
             vec![Frontier {
@@ -57,6 +62,7 @@ where
         ShortestFirstWalk {
             fst,
             automaton,
+            zero_width,
             frontier,
             level: 0,
         }
@@ -69,8 +75,13 @@ where
 
     /// Follows one whole UTF-8 character (lead + continuation bytes) from
     /// `entry`, pushing every reachable node after it into `next`. Zero-width
-    /// quote transitions go to `same` (this level) instead.
-    fn expand(&self, entry: &Frontier<A::State>, same: &mut Vec<Frontier<A::State>>, next: &mut Vec<Frontier<A::State>>) {
+    /// transitions go to `same` (this level) instead.
+    fn expand(
+        &self,
+        entry: &Frontier<A::State>,
+        same: &mut Vec<Frontier<A::State>>,
+        next: &mut Vec<Frontier<A::State>>,
+    ) {
         let node = self.fst.node(entry.addr);
         for t in node.transitions() {
             let state = self.automaton.accept(&entry.state, t.inp);
@@ -85,7 +96,7 @@ where
                 state,
                 key,
             };
-            if t.inp == b'"' {
+            if self.zero_width.contains(t.inp) {
                 same.push(child);
                 continue;
             }
@@ -101,7 +112,12 @@ where
     }
 
     /// Consumes `remaining` continuation bytes, then pushes into `next`.
-    fn complete_char(&self, entry: Frontier<A::State>, remaining: usize, next: &mut Vec<Frontier<A::State>>) {
+    fn complete_char(
+        &self,
+        entry: Frontier<A::State>,
+        remaining: usize,
+        next: &mut Vec<Frontier<A::State>>,
+    ) {
         if remaining == 0 {
             next.push(entry);
             return;

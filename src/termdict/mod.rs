@@ -140,20 +140,25 @@ impl TermDictionary {
     }
 
     /// Walks the automaton's matches shortest first, one length level (in
-    /// characters) at a time, as (key, term info). Stop pulling levels when
-    /// enough terms are collected: longer matches are then never visited.
-    #[cfg(not(feature = "quickwit"))]
-    pub fn search_shortest_first<'a, A>(&'a self, automaton: &'a A) -> ShortestFirstTerms<'a, A>
+    /// characters, see [`ZeroWidthBytes`]) at a time. Stop pulling levels
+    /// when enough terms are collected.
+    ///
+    /// With the FST dictionary this is a breadth-first walk of the FST and
+    /// the levels that are never pulled are never visited. The SSTable
+    /// dictionary has no such structure: it walks the whole expansion once
+    /// and groups it by length, so the result is the same but the cost is
+    /// that of a full walk.
+    pub fn search_shortest_first<'a, A>(
+        &'a self,
+        automaton: &'a A,
+        zero_width: ZeroWidthBytes,
+    ) -> ShortestFirstTerms<'a, A>
     where
-        A: tantivy_fst::Automaton,
+        A: Automaton,
         A::State: Clone,
     {
-        ShortestFirstTerms {
-            dict: &self.0,
-            walk: self.0.search_shortest_first(automaton),
-        }
+        ShortestFirstTerms::new(&self.0, automaton, zero_width)
     }
-
 
     /// Returns a range builder, to stream all of the terms
     /// within an interval.
@@ -240,10 +245,65 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     }
 }
 
+/// ASCII bytes that do not count towards a term's length in
+/// [`TermDictionary::search_shortest_first`] and the expansion cap of
+/// [`AutomatonWeight`](crate::query::AutomatonWeight): an intra-word mark a
+/// tokenizer keeps inside its terms (an apostrophe, a quote, a hyphen) that
+/// should not make the term "longer" than the same word without it.
+///
+/// Only ASCII bytes can be zero-width: a multi-byte character is always
+/// counted as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZeroWidthBytes([u64; 4]);
+
+impl ZeroWidthBytes {
+    /// Every byte counts.
+    pub const NONE: ZeroWidthBytes = ZeroWidthBytes([0; 4]);
+
+    /// The given ASCII bytes are zero-width.
+    ///
+    /// # Panics
+    /// If a byte is not ASCII.
+    pub const fn new(bytes: &[u8]) -> ZeroWidthBytes {
+        let mut bits = [0u64; 4];
+        let mut i = 0;
+        while i < bytes.len() {
+            let byte = bytes[i];
+            assert!(byte.is_ascii(), "zero-width bytes must be ASCII");
+            bits[(byte >> 6) as usize] |= 1u64 << (byte & 63);
+            i += 1;
+        }
+        ZeroWidthBytes(bits)
+    }
+
+    /// Whether `byte` is zero-width.
+    #[inline]
+    pub fn contains(&self, byte: u8) -> bool {
+        (self.0[(byte >> 6) as usize] >> (byte & 63)) & 1 == 1
+    }
+
+    /// Whether no byte is zero-width.
+    pub fn is_empty(&self) -> bool {
+        self.0 == [0; 4]
+    }
+
+    /// The length of a term in characters: UTF-8 characters, not counting
+    /// the zero-width bytes.
+    pub fn term_len(&self, key: &[u8]) -> usize {
+        key.iter()
+            .filter(|&&b| b & 0xC0 != 0x80 && !self.contains(b))
+            .count()
+    }
+}
+
+/// One level of a shortest-first walk: every matching term of one length,
+/// with its [`TermInfo`], in byte order.
+pub type ShortestFirstLevel = Vec<(Vec<u8>, TermInfo)>;
+
 /// Shortest-first walk over a [`TermDictionary`]: see
 /// [`TermDictionary::search_shortest_first`].
 #[cfg(not(feature = "quickwit"))]
-pub struct ShortestFirstTerms<'a, A: tantivy_fst::Automaton> {
+pub struct ShortestFirstTerms<'a, A: Automaton> {
     dict: &'a fst_termdict::TermDictionary,
     walk: fst_termdict::shortest_first::ShortestFirstWalk<'a, A>,
 }
@@ -251,26 +311,85 @@ pub struct ShortestFirstTerms<'a, A: tantivy_fst::Automaton> {
 #[cfg(not(feature = "quickwit"))]
 impl<'a, A> ShortestFirstTerms<'a, A>
 where
-    A: tantivy_fst::Automaton,
+    A: Automaton,
     A::State: Clone,
 {
-    /// Identity: lets callers name the level-pulling API explicitly.
-    pub fn peekable_levels(self) -> Self {
-        self
+    fn new(
+        dict: &'a fst_termdict::TermDictionary,
+        automaton: &'a A,
+        zero_width: ZeroWidthBytes,
+    ) -> Self {
+        ShortestFirstTerms {
+            dict,
+            walk: dict.search_shortest_first(automaton, zero_width),
+        }
     }
 
-    /// The next non-empty level: (length in characters, matches with their
-    /// term infos, in byte order). None when the walk is exhausted.
-    pub fn next_level(&mut self) -> Option<(usize, Vec<(Vec<u8>, TermInfo)>)> {
-        let level = self.walk.next()?;
+    /// The next non-empty level: (length in characters, its terms). `None`
+    /// when the walk is exhausted.
+    pub fn next_level(&mut self) -> io::Result<Option<(usize, ShortestFirstLevel)>> {
+        let Some(level) = self.walk.next() else {
+            return Ok(None);
+        };
         let length = self.walk.level() - 1;
         let dict = self.dict;
-        Some((
-            length,
-            level
-                .into_iter()
-                .map(|(key, ord)| (key, dict.term_info_from_ord(ord)))
-                .collect(),
-        ))
+        let terms = level
+            .into_iter()
+            .map(|(key, ord)| (key, dict.term_info_from_ord(ord)))
+            .collect();
+        Ok(Some((length, terms)))
+    }
+}
+
+/// Shortest-first walk over a [`TermDictionary`]: see
+/// [`TermDictionary::search_shortest_first`].
+///
+/// The SSTable dictionary cannot be walked breadth-first; the first call
+/// streams the whole expansion and groups it by length.
+#[cfg(feature = "quickwit")]
+pub struct ShortestFirstTerms<'a, A: Automaton> {
+    dict: &'a sstable_termdict::TermDictionary,
+    automaton: &'a A,
+    zero_width: ZeroWidthBytes,
+    levels: Option<std::vec::IntoIter<(usize, ShortestFirstLevel)>>,
+}
+
+#[cfg(feature = "quickwit")]
+impl<'a, A> ShortestFirstTerms<'a, A>
+where
+    A: Automaton,
+    A::State: Clone,
+{
+    fn new(
+        dict: &'a sstable_termdict::TermDictionary,
+        automaton: &'a A,
+        zero_width: ZeroWidthBytes,
+    ) -> Self {
+        ShortestFirstTerms {
+            dict,
+            automaton,
+            zero_width,
+            levels: None,
+        }
+    }
+
+    /// The next non-empty level: (length in characters, its terms). `None`
+    /// when the walk is exhausted.
+    pub fn next_level(&mut self) -> io::Result<Option<(usize, ShortestFirstLevel)>> {
+        if self.levels.is_none() {
+            let mut by_len: std::collections::BTreeMap<usize, ShortestFirstLevel> =
+                std::collections::BTreeMap::new();
+            let mut stream = self.dict.search(self.automaton).into_stream()?;
+            while stream.advance() {
+                let key = stream.key().to_vec();
+                let len = self.zero_width.term_len(&key);
+                by_len
+                    .entry(len)
+                    .or_default()
+                    .push((key, stream.value().clone()));
+            }
+            self.levels = Some(by_len.into_iter().collect::<Vec<_>>().into_iter());
+        }
+        Ok(self.levels.as_mut().unwrap().next())
     }
 }

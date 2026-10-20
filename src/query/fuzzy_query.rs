@@ -80,7 +80,7 @@ impl Automaton for DfaWrapper {
 /// }
 /// # assert!(example().is_ok());
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FuzzyTermQuery {
     /// What term are we searching
     term: Term,
@@ -96,6 +96,17 @@ pub struct FuzzyTermQuery {
     /// When set, at most this many matched terms are used per segment,
     /// closest (edit distance) first, then shortest, then most frequent.
     max_expansions: Option<usize>,
+}
+
+impl std::fmt::Debug for FuzzyTermQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuzzyTermQuery")
+            .field("term", &self.term)
+            .field("distance", &self.distance)
+            .field("transposition_cost_one", &self.transposition_cost_one)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl FuzzyTermQuery {
@@ -208,7 +219,11 @@ impl FuzzyTermQuery {
     fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
         let automaton = std::sync::Arc::new(self.automaton()?);
         let mut weight = if let Some((json_path_bytes, _)) = self.term.value().as_json() {
-            AutomatonWeight::new_for_json_path(self.term.field(), automaton.clone(), json_path_bytes)
+            AutomatonWeight::new_for_json_path(
+                self.term.field(),
+                automaton.clone(),
+                json_path_bytes,
+            )
         } else {
             AutomatonWeight::new(self.term.field(), automaton.clone())
         };
@@ -387,7 +402,11 @@ mod test {
             index_writer.add_document(doc!(country_field => "japon"))?;
             index_writer.commit()?;
             let searcher = index.reader()?.searcher();
-            assert_eq!(searcher.segment_readers().len(), 2, "test needs two segments");
+            assert_eq!(
+                searcher.segment_readers().len(),
+                2,
+                "test needs two segments"
+            );
             let term = Term::from_field_text(country_field, "japan");
             let mut fuzzy_query = FuzzyTermQuery::new(term, 1, true);
             let sink = crate::query::MatchedTermsSink::new();

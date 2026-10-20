@@ -1,7 +1,7 @@
 //! Span query: "word A, then within N words word B, then within M words
 //! word C…", where every slot is any term source — a plain term, a fuzzy or
-//! regex automaton, or any custom [`Automaton`] (e.g. Hebrew
-//! prefix/suffix walks).
+//! regex automaton, or any custom [`Automaton`] (e.g. a language-specific
+//! prefix/suffix walk).
 //!
 //! Each slot's matching terms are opened WITH positions and unioned into one
 //! positioned posting list ("any word of this slot"), the way
@@ -117,7 +117,6 @@ impl SpanQuery {
     pub fn set_ordered(&mut self, ordered: bool) {
         self.ordered = ordered;
     }
-
 }
 
 impl Query for SpanQuery {
@@ -153,7 +152,11 @@ struct SpanWeight {
 type SlotPostings = crate::query::union::SimpleUnion<Box<dyn Postings + 'static>>;
 
 impl SpanWeight {
-    fn span_scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Option<SpanScorer>> {
+    fn span_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> crate::Result<Option<SpanScorer>> {
         let inverted_index = reader.inverted_index(self.field)?;
         // Expansion caps are each slot's own business (an AutomatonWeight
         // slot caps by rank); a span never fails for being broad.
@@ -452,7 +455,10 @@ mod tests {
         weight.set_matched_terms_sink(sink.clone());
         let q = SpanQuery::new(f, Arc::new(weight)).then_within(1, exact(f, "korea"));
         assert_eq!(search(&index, &q)?, vec![0, 1]);
-        assert_eq!(sink.take_strings(), vec!["japan".to_string(), "japon".to_string()]);
+        assert_eq!(
+            sink.take_strings(),
+            vec!["japan".to_string(), "japon".to_string()]
+        );
         Ok(())
     }
 

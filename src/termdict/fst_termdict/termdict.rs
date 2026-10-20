@@ -194,12 +194,17 @@ impl TermDictionary {
     pub fn search_shortest_first<'a, A>(
         &'a self,
         automaton: &'a A,
+        zero_width: crate::termdict::ZeroWidthBytes,
     ) -> super::shortest_first::ShortestFirstWalk<'a, A>
     where
         A: Automaton,
         A::State: Clone,
     {
-        super::shortest_first::ShortestFirstWalk::new(self.fst_index.as_fst(), automaton)
+        super::shortest_first::ShortestFirstWalk::new(
+            self.fst_index.as_fst(),
+            automaton,
+            zero_width,
+        )
     }
 
     /// Returns the number of terms in the dictionary.

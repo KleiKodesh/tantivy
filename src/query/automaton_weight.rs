@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -11,7 +11,7 @@ use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
-use crate::termdict::{TermDictionary, TermStreamer, WithoutKeys};
+use crate::termdict::{TermDictionary, TermStreamer, WithoutKeys, ZeroWidthBytes};
 use crate::{DocId, Score, TantivyError};
 
 /// Collects the terms an [`AutomatonWeight`] matched in the term dictionary
@@ -100,6 +100,8 @@ pub struct AutomatonWeight<A> {
     max_expansions: Option<usize>,
     // Primary sort key for capping; `None` ranks every term 0.
     expansion_rank: Option<ExpansionRank>,
+    // Bytes that do not count towards a term's length when capping.
+    zero_width: ZeroWidthBytes,
 }
 
 impl<A> AutomatonWeight<A>
@@ -116,6 +118,7 @@ where
             matched_terms_sink: None,
             max_expansions: None,
             expansion_rank: None,
+            zero_width: ZeroWidthBytes::NONE,
         }
     }
 
@@ -132,6 +135,7 @@ where
             matched_terms_sink: None,
             max_expansions: None,
             expansion_rank: None,
+            zero_width: ZeroWidthBytes::NONE,
         }
     }
 
@@ -141,18 +145,25 @@ where
         self.matched_terms_sink = Some(sink);
     }
 
-    /// Caps the expansion PER SEGMENT: when the automaton matches more than
-    /// `cap` terms in a segment, only the best `cap` are used (and reported
-    /// to the sink).
+    /// Caps the expansion: when the automaton matches more than `cap` terms
+    /// in a segment's dictionary, only the best `cap` of that segment are
+    /// used (and reported to the sink). Without a cap, every match is used,
+    /// exactly as before.
     ///
-    /// Unranked caps walk shortest first INSIDE the walk: the segment's
-    /// dictionary is walked level by level (term length in characters) and
-    /// the walk stops once the cap is reached, so the closest matches (the
-    /// bare word, then the shortest affixes) come first and the long tail is
-    /// never visited. Ties on the last level go to the higher document
-    /// count, then byte order. Ranked caps (fuzzy: edit distance first) and
-    /// JSON-path weights walk the full expansion and sort it by (rank,
-    /// shortest, most frequent, bytes).
+    /// Which terms are "best": the lowest [rank](Self::set_expansion_rank)
+    /// first, then the shortest (in characters, see
+    /// [`set_zero_width_bytes`](Self::set_zero_width_bytes)), then the
+    /// highest document count, then byte order.
+    ///
+    /// Without a rank (and outside JSON paths) the cap is applied INSIDE the
+    /// dictionary walk: the dictionary is walked shortest first, level by
+    /// level, and the walk stops once the cap is reached, so the long tail of
+    /// a broad pattern is never visited. With a rank the whole expansion is
+    /// walked and sorted, since the rank is not known before a term is seen.
+    ///
+    /// The cap is per segment: an index with several segments may use up to
+    /// `cap` terms in each. Merging the index into one segment makes the cap
+    /// global.
     pub fn set_max_expansions(&mut self, cap: usize) {
         self.max_expansions = Some(cap);
     }
@@ -162,84 +173,53 @@ where
         self.expansion_rank = Some(rank);
     }
 
-    fn uses_shortest_first_walk(&self) -> bool {
-        cfg!(not(feature = "quickwit"))
-            && self.expansion_rank.is_none()
-            && self.json_path_bytes.is_none()
+    /// Bytes that do not count towards a term's length when the cap prefers
+    /// shorter terms, e.g. an intra-word apostrophe or quote the tokenizer
+    /// keeps. See [`ZeroWidthBytes`].
+    pub fn set_zero_width_bytes(&mut self, zero_width: ZeroWidthBytes) {
+        self.zero_width = zero_width;
     }
 
-    /// Level-by-level walk over all `dicts` together; stops at `cap`.
-    #[cfg(not(feature = "quickwit"))]
-    fn cap_shortest_first(&self, dicts: &[&TermDictionary], cap: usize) -> Vec<Vec<u8>> {
+    fn uses_shortest_first_walk(&self) -> bool {
+        self.expansion_rank.is_none() && self.json_path_bytes.is_none()
+    }
+
+    /// Level-by-level walk of `dict`; stops at `cap`. Ties on the last level
+    /// go to the higher document count, then byte order.
+    fn cap_shortest_first(&self, dict: &TermDictionary, cap: usize) -> io::Result<Vec<Vec<u8>>> {
         let automaton: &A = &self.automaton;
-        // (level of the peeked batch, peeked batch, walker) per segment
-        let mut walkers: Vec<_> = dicts
-            .iter()
-            .map(|d| {
-                let mut walk = d.search_shortest_first(automaton).peekable_levels();
-                let peeked = walk.next_level();
-                (peeked, walk)
-            })
-            .collect();
+        let mut walk = dict.search_shortest_first(automaton, self.zero_width);
         let mut kept: Vec<Vec<u8>> = Vec::new();
         while kept.len() < cap {
-            let Some(level) = walkers
-                .iter()
-                .filter_map(|(p, _)| p.as_ref().map(|(lvl, _)| *lvl))
-                .min()
-            else {
-                break; // every segment exhausted
+            let Some((_, level)) = walk.next_level()? else {
+                break;
             };
-            // merge this level across segments, summing document counts
-            let mut doc_freq: HashMap<Vec<u8>, u64> = HashMap::new();
-            for (peeked, walk) in walkers.iter_mut() {
-                if peeked.as_ref().is_some_and(|(lvl, _)| *lvl == level) {
-                    let (_, batch) = peeked.take().unwrap();
-                    for (key, info) in batch {
-                        *doc_freq.entry(key).or_insert(0) += info.doc_freq as u64;
-                    }
-                    *peeked = walk.next_level();
-                }
-            }
             let room = cap - kept.len();
-            if doc_freq.len() <= room {
-                kept.extend(doc_freq.into_keys());
+            if level.len() <= room {
+                kept.extend(level.into_iter().map(|(key, _)| key));
             } else {
-                let mut level_terms: Vec<(std::cmp::Reverse<u64>, Vec<u8>)> = doc_freq
+                let mut level_terms: Vec<(std::cmp::Reverse<u32>, Vec<u8>)> = level
                     .into_iter()
-                    .map(|(k, df)| (std::cmp::Reverse(df), k))
+                    .map(|(key, info)| (std::cmp::Reverse(info.doc_freq), key))
                     .collect();
                 level_terms.sort_unstable();
-                kept.extend(level_terms.into_iter().take(room).map(|(_, k)| k));
+                kept.extend(level_terms.into_iter().take(room).map(|(_, key)| key));
             }
         }
-        kept
+        Ok(kept)
     }
 
-    #[cfg(feature = "quickwit")]
-    fn cap_shortest_first(&self, dicts: &[&TermDictionary], cap: usize) -> Vec<Vec<u8>> {
-        self.cap_full_walk(dicts, cap).unwrap_or_default()
-    }
-
-    /// Full walk of every dict, then sort by (rank, shortest, most frequent,
+    /// Full walk of `dict`, then sort by (rank, shortest, most frequent,
     /// bytes) and keep `cap`.
-    fn cap_full_walk(&self, dicts: &[&TermDictionary], cap: usize) -> io::Result<Vec<Vec<u8>>> {
-        let mut doc_freq: HashMap<Vec<u8>, u64> = HashMap::new();
-        for dict in dicts {
-            let mut stream = self.automaton_stream_with_keys(dict)?;
-            while stream.advance() {
-                *doc_freq.entry(stream.key().to_vec()).or_insert(0) +=
-                    stream.value().doc_freq as u64;
-            }
+    fn cap_full_walk(&self, dict: &TermDictionary, cap: usize) -> io::Result<Vec<Vec<u8>>> {
+        let mut stream = self.automaton_stream_with_keys(dict)?;
+        let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u32>, Vec<u8>)> = Vec::new();
+        while stream.advance() {
+            let key = stream.key().to_vec();
+            let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
+            let chars = self.zero_width.term_len(&key);
+            ranked.push((rank, chars, std::cmp::Reverse(stream.value().doc_freq), key));
         }
-        let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u64>, Vec<u8>)> = doc_freq
-            .into_iter()
-            .map(|(key, df)| {
-                let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
-                let chars = key.iter().filter(|&&b| b & 0xC0 != 0x80 && b != b'"').count();
-                (rank, chars, std::cmp::Reverse(df), key)
-            })
-            .collect();
         ranked.sort_unstable();
         ranked.truncate(cap);
         Ok(ranked.into_iter().map(|e| e.3).collect())
@@ -248,12 +228,11 @@ where
     /// Every term the automaton matches in `term_dict`, capped and reported
     /// to the sink as configured.
     fn matched_terms(&self, term_dict: &TermDictionary) -> io::Result<Vec<TermInfo>> {
-        // Cap per segment.
         if let Some(cap) = self.max_expansions {
             let kept = if self.uses_shortest_first_walk() {
-                self.cap_shortest_first(&[term_dict], cap)
+                self.cap_shortest_first(term_dict, cap)?
             } else {
-                self.cap_full_walk(&[term_dict], cap)?
+                self.cap_full_walk(term_dict, cap)?
             };
             let mut infos = Vec::with_capacity(kept.len());
             let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
@@ -468,7 +447,10 @@ mod tests {
         assert_eq!(scorer.advance(), 2u32);
         assert_eq!(scorer.advance(), TERMINATED);
         // ...plus the matched words, and only the matched words.
-        assert_eq!(sink.take_strings(), vec!["abc".to_string(), "abcd".to_string()]);
+        assert_eq!(
+            sink.take_strings(),
+            vec!["abc".to_string(), "abcd".to_string()]
+        );
         assert!(sink.is_empty(), "take_strings drains the sink");
         Ok(())
     }

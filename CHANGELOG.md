@@ -1,3 +1,11 @@
+Unreleased
+================================
+
+## Features/Improvements
+- `AutomatonWeight` (and `FuzzyTermQuery`, `RegexQuery`) can report the terms the automaton matched in the term dictionary through an opt-in `MatchedTermsSink`, at no cost when unused.
+- `AutomatonWeight::set_max_expansions` caps an automaton expansion per segment instead of expanding without limit: unranked caps walk the term dictionary shortest first (`TermDictionary::search_shortest_first`) and stop at the cap; `FuzzyTermQuery` ranks by edit distance. `RegexPhraseQuery` keeps the best terms of each slot instead of failing with "exceeded max expansions". `ZeroWidthBytes` lets a tokenizer's intra-word marks not count towards term length.
+- `SpanQuery`: a phrase of arbitrary term sources (exact, fuzzy, regex, any automaton) with a separate maximum word distance per gap, ordered or unordered.
+
 Tantivy 0.27.0
 ================================
 
