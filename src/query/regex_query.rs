@@ -110,12 +110,8 @@ impl RegexQuery {
 }
 
 impl Query for RegexQuery {
-    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        let mut weight = self.specialized_weight();
-        if let Some(searcher) = enable_scoring.searcher() {
-            weight.apply_global_cap(searcher)?;
-        }
-        Ok(Box::new(weight))
+    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.specialized_weight()))
     }
 }
 
@@ -131,12 +127,12 @@ mod test {
     use crate::{assert_nearly_equals, Index, IndexReader, IndexWriter};
 
     #[test]
-    fn test_regex_cap_walks_shortest_first_across_segments() -> crate::Result<()> {
+    fn test_regex_cap_walks_shortest_first_per_segment() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let field = schema_builder.add_text_field("t", TEXT);
         let index = Index::create_in_ram(schema_builder.build());
-        // three segments; the longest terms sort FIRST alphabetically, so an
-        // alphabetical walk + cut would keep the wrong ones
+        // three segments; in each, the longer term sorts FIRST alphabetically,
+        // so an alphabetical walk + cut would keep the wrong one
         for words in [["aaaaa", "ab"], ["aaaa", "abc"], ["aaa", "abcd"]] {
             let mut writer: IndexWriter = index.writer_for_tests()?;
             for w in words {
@@ -150,10 +146,10 @@ mod test {
         let mut query = RegexQuery::from_pattern("a.*", field)?;
         let sink = crate::query::MatchedTermsSink::new();
         query.set_matched_terms_sink(sink.clone());
-        query.set_max_expansions(3);
+        query.set_max_expansions(1);
         let count = searcher.search(&query, &crate::collector::Count)?;
         assert_eq!(count, 3);
-        // length 2: ab; length 3: aaa, abc → exactly the 3 shortest
+        // cap 1 per segment: the shortest of each → ab, abc, aaa
         assert_eq!(
             sink.take_strings(),
             vec!["aaa".to_string(), "ab".to_string(), "abc".to_string()]

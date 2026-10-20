@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -100,10 +100,6 @@ pub struct AutomatonWeight<A> {
     max_expansions: Option<usize>,
     // Primary sort key for capping; `None` ranks every term 0.
     expansion_rank: Option<ExpansionRank>,
-    // The capped term set, chosen once over the whole index by
-    // `apply_global_cap`. When set, every segment uses exactly these terms;
-    // when absent, the cap falls back to per segment.
-    allowed_terms: Option<Arc<HashSet<Vec<u8>>>>,
 }
 
 impl<A> AutomatonWeight<A>
@@ -120,7 +116,6 @@ where
             matched_terms_sink: None,
             max_expansions: None,
             expansion_rank: None,
-            allowed_terms: None,
         }
     }
 
@@ -137,7 +132,6 @@ where
             matched_terms_sink: None,
             max_expansions: None,
             expansion_rank: None,
-            allowed_terms: None,
         }
     }
 
@@ -147,13 +141,18 @@ where
         self.matched_terms_sink = Some(sink);
     }
 
-    /// Caps the expansion: when the automaton matches more than `cap` terms
-    /// in a segment, only the best `cap` are used (and reported to the
-    /// sink). Best = lowest [`ExpansionRank`] (0 when none is set), then the
-    /// shortest term, then the higher document count, then dictionary
-    /// order; this is FtsLib's wildcard/fuzzy cap rule. The walk itself is
-    /// not cut short, so the choice is deterministic and does not depend on
-    /// dictionary order alone.
+    /// Caps the expansion PER SEGMENT: when the automaton matches more than
+    /// `cap` terms in a segment, only the best `cap` are used (and reported
+    /// to the sink).
+    ///
+    /// Unranked caps walk shortest first INSIDE the walk: the segment's
+    /// dictionary is walked level by level (term length in characters) and
+    /// the walk stops once the cap is reached, so the closest matches (the
+    /// bare word, then the shortest affixes) come first and the long tail is
+    /// never visited. Ties on the last level go to the higher document
+    /// count, then byte order. Ranked caps (fuzzy: edit distance first) and
+    /// JSON-path weights walk the full expansion and sort it by (rank,
+    /// shortest, most frequent, bytes).
     pub fn set_max_expansions(&mut self, cap: usize) {
         self.max_expansions = Some(cap);
     }
@@ -161,35 +160,6 @@ where
     /// The primary key the cap sorts by (e.g. a fuzzy match's edit distance).
     pub fn set_expansion_rank(&mut self, rank: ExpansionRank) {
         self.expansion_rank = Some(rank);
-    }
-
-    /// Chooses the capped term set ONCE over every segment of `searcher`, so
-    /// all segments use the same terms, as FtsLib's single term index does.
-    /// Without this call the cap is applied per segment. No-op without a cap.
-    ///
-    /// Unranked caps walk shortest first INSIDE the walk: all segments'
-    /// dictionaries are walked level by level (term length in characters), in
-    /// lockstep, and the walk stops once the cap is reached. The bare word
-    /// comes first, then the shortest affixes; the long tail is never
-    /// visited. Ties on the last level go to the higher document count (summed
-    /// over segments), then byte order. Ranked caps (fuzzy: edit distance
-    /// first) and JSON-path weights walk the full expansion and sort it.
-    pub fn apply_global_cap(&mut self, searcher: &crate::Searcher) -> crate::Result<()> {
-        let Some(cap) = self.max_expansions else {
-            return Ok(());
-        };
-        let mut dicts = Vec::new();
-        for segment in searcher.segment_readers() {
-            dicts.push(segment.inverted_index(self.field)?);
-        }
-        let terms: Vec<&TermDictionary> = dicts.iter().map(|d| d.terms()).collect();
-        let kept = if self.uses_shortest_first_walk() {
-            self.cap_shortest_first(&terms, cap)
-        } else {
-            self.cap_full_walk(&terms, cap)?
-        };
-        self.allowed_terms = Some(Arc::new(kept.into_iter().collect()));
-        Ok(())
     }
 
     fn uses_shortest_first_walk(&self) -> bool {
@@ -278,21 +248,7 @@ where
     /// Every term the automaton matches in `term_dict`, capped and reported
     /// to the sink as configured.
     fn matched_terms(&self, term_dict: &TermDictionary) -> io::Result<Vec<TermInfo>> {
-        // Cap chosen globally: look the kept terms up directly, no re-walk.
-        if let Some(allowed) = &self.allowed_terms {
-            let mut infos = Vec::with_capacity(allowed.len());
-            let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
-            for key in allowed.iter() {
-                if let Some(info) = term_dict.get(key)? {
-                    if let Some(sink) = sink.as_mut() {
-                        sink.insert(key.clone());
-                    }
-                    infos.push(info);
-                }
-            }
-            return Ok(infos);
-        }
-        // Cap without a searcher: choose per segment, same rules.
+        // Cap per segment.
         if let Some(cap) = self.max_expansions {
             let kept = if self.uses_shortest_first_walk() {
                 self.cap_shortest_first(&[term_dict], cap)

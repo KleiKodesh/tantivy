@@ -229,12 +229,8 @@ impl FuzzyTermQuery {
 }
 
 impl Query for FuzzyTermQuery {
-    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        let mut weight = self.specialized_weight()?;
-        if let Some(searcher) = enable_scoring.searcher() {
-            weight.apply_global_cap(searcher)?;
-        }
-        Ok(Box::new(weight))
+    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.specialized_weight()?))
     }
 }
 
@@ -384,9 +380,8 @@ mod test {
             assert_nearly_equals!(1.0, score);
         }
 
-        // a cap keeps the closest matches: distance 0 "japan" over distance 1
-        // "japon" — chosen over the WHOLE index, even though "japon" sits alone
-        // in its own segment
+        // the cap applies per segment: segment 1 keeps "japan" (distance 0),
+        // segment 2 holds only "japon", so it keeps that
         {
             let mut index_writer: IndexWriter = index.writer_for_tests()?;
             index_writer.add_document(doc!(country_field => "japon"))?;
@@ -400,8 +395,11 @@ mod test {
             fuzzy_query.set_max_expansions(1);
             let top_docs =
                 searcher.search(&fuzzy_query, &TopDocs::with_limit(5).order_by_score())?;
-            assert_eq!(top_docs.len(), 1, "only the closest term's docs");
-            assert_eq!(sink.take_strings(), vec!["japan".to_string()]);
+            assert_eq!(top_docs.len(), 2, "one term per segment");
+            assert_eq!(
+                sink.take_strings(),
+                vec!["japan".to_string(), "japon".to_string()]
+            );
         }
 
         // with a sink attached, the search also reports the words the fuzzy
