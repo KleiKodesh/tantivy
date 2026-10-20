@@ -130,6 +130,37 @@ mod test {
     use crate::schema::{Field, Schema, TEXT};
     use crate::{assert_nearly_equals, Index, IndexReader, IndexWriter};
 
+    #[test]
+    fn test_regex_cap_walks_shortest_first_across_segments() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("t", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        // three segments; the longest terms sort FIRST alphabetically, so an
+        // alphabetical walk + cut would keep the wrong ones
+        for words in [["aaaaa", "ab"], ["aaaa", "abc"], ["aaa", "abcd"]] {
+            let mut writer: IndexWriter = index.writer_for_tests()?;
+            for w in words {
+                writer.add_document(doc!(field => w))?;
+            }
+            writer.commit()?;
+        }
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
+
+        let mut query = RegexQuery::from_pattern("a.*", field)?;
+        let sink = crate::query::MatchedTermsSink::new();
+        query.set_matched_terms_sink(sink.clone());
+        query.set_max_expansions(3);
+        let count = searcher.search(&query, &crate::collector::Count)?;
+        assert_eq!(count, 3);
+        // length 2: ab; length 3: aaa, abc → exactly the 3 shortest
+        assert_eq!(
+            sink.take_strings(),
+            vec!["aaa".to_string(), "ab".to_string(), "abc".to_string()]
+        );
+        Ok(())
+    }
+
     fn build_test_index() -> crate::Result<(IndexReader, Field)> {
         let mut schema_builder = Schema::builder();
         let country_field = schema_builder.add_text_field("country", TEXT);

@@ -189,6 +189,19 @@ impl TermDictionary {
         Ok(true)
     }
 
+    /// Walks the automaton's matches shortest first, one length level at a
+    /// time (see [`ShortestFirstWalk`](super::shortest_first::ShortestFirstWalk)).
+    pub fn search_shortest_first<'a, A>(
+        &'a self,
+        automaton: &'a A,
+    ) -> super::shortest_first::ShortestFirstWalk<'a, A>
+    where
+        A: Automaton,
+        A::State: Clone,
+    {
+        super::shortest_first::ShortestFirstWalk::new(self.fst_index.as_fst(), automaton)
+    }
+
     /// Returns the number of terms in the dictionary.
     pub fn term_info_from_ord(&self, term_ord: TermOrdinal) -> TermInfo {
         self.term_info_store.get(term_ord)

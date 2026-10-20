@@ -139,6 +139,22 @@ impl TermDictionary {
         self.0.get(key)
     }
 
+    /// Walks the automaton's matches shortest first, one length level (in
+    /// characters) at a time, as (key, term info). Stop pulling levels when
+    /// enough terms are collected: longer matches are then never visited.
+    #[cfg(not(feature = "quickwit"))]
+    pub fn search_shortest_first<'a, A>(&'a self, automaton: &'a A) -> ShortestFirstTerms<'a, A>
+    where
+        A: tantivy_fst::Automaton,
+        A::State: Clone,
+    {
+        ShortestFirstTerms {
+            dict: &self.0,
+            walk: self.0.search_shortest_first(automaton),
+        }
+    }
+
+
     /// Returns a range builder, to stream all of the terms
     /// within an interval.
     pub fn range(&self) -> TermStreamerBuilder<'_> {
@@ -221,5 +237,40 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
         let mut writer = self.0.finish()?;
         (CURRENT_TYPE as u32).serialize(&mut writer)?;
         Ok(writer)
+    }
+}
+
+/// Shortest-first walk over a [`TermDictionary`]: see
+/// [`TermDictionary::search_shortest_first`].
+#[cfg(not(feature = "quickwit"))]
+pub struct ShortestFirstTerms<'a, A: tantivy_fst::Automaton> {
+    dict: &'a fst_termdict::TermDictionary,
+    walk: fst_termdict::shortest_first::ShortestFirstWalk<'a, A>,
+}
+
+#[cfg(not(feature = "quickwit"))]
+impl<'a, A> ShortestFirstTerms<'a, A>
+where
+    A: tantivy_fst::Automaton,
+    A::State: Clone,
+{
+    /// Identity: lets callers name the level-pulling API explicitly.
+    pub fn peekable_levels(self) -> Self {
+        self
+    }
+
+    /// The next non-empty level: (length in characters, matches with their
+    /// term infos, in byte order). None when the walk is exhausted.
+    pub fn next_level(&mut self) -> Option<(usize, Vec<(Vec<u8>, TermInfo)>)> {
+        let level = self.walk.next()?;
+        let length = self.walk.level() - 1;
+        let dict = self.dict;
+        Some((
+            length,
+            level
+                .into_iter()
+                .map(|(key, ord)| (key, dict.term_info_from_ord(ord)))
+                .collect(),
+        ))
     }
 }

@@ -163,110 +163,171 @@ where
         self.expansion_rank = Some(rank);
     }
 
-    /// Chooses the capped term set ONCE over every segment of `searcher`
-    /// (document counts summed across segments), so all segments use the same
-    /// terms, as FtsLib's single term index does. Without this call the cap
-    /// is applied per segment. No-op when no cap is set or the expansion fits.
+    /// Chooses the capped term set ONCE over every segment of `searcher`, so
+    /// all segments use the same terms, as FtsLib's single term index does.
+    /// Without this call the cap is applied per segment. No-op without a cap.
+    ///
+    /// Unranked caps walk shortest first INSIDE the walk: all segments'
+    /// dictionaries are walked level by level (term length in characters), in
+    /// lockstep, and the walk stops once the cap is reached. The bare word
+    /// comes first, then the shortest affixes; the long tail is never
+    /// visited. Ties on the last level go to the higher document count (summed
+    /// over segments), then byte order. Ranked caps (fuzzy: edit distance
+    /// first) and JSON-path weights walk the full expansion and sort it.
     pub fn apply_global_cap(&mut self, searcher: &crate::Searcher) -> crate::Result<()> {
         let Some(cap) = self.max_expansions else {
             return Ok(());
         };
-        let mut doc_freq: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut dicts = Vec::new();
         for segment in searcher.segment_readers() {
-            let inverted_index = segment.inverted_index(self.field)?;
-            let mut stream = self.automaton_stream_with_keys(inverted_index.terms())?;
+            dicts.push(segment.inverted_index(self.field)?);
+        }
+        let terms: Vec<&TermDictionary> = dicts.iter().map(|d| d.terms()).collect();
+        let kept = if self.uses_shortest_first_walk() {
+            self.cap_shortest_first(&terms, cap)
+        } else {
+            self.cap_full_walk(&terms, cap)?
+        };
+        self.allowed_terms = Some(Arc::new(kept.into_iter().collect()));
+        Ok(())
+    }
+
+    fn uses_shortest_first_walk(&self) -> bool {
+        cfg!(not(feature = "quickwit"))
+            && self.expansion_rank.is_none()
+            && self.json_path_bytes.is_none()
+    }
+
+    /// Level-by-level walk over all `dicts` together; stops at `cap`.
+    #[cfg(not(feature = "quickwit"))]
+    fn cap_shortest_first(&self, dicts: &[&TermDictionary], cap: usize) -> Vec<Vec<u8>> {
+        let automaton: &A = &self.automaton;
+        // (level of the peeked batch, peeked batch, walker) per segment
+        let mut walkers: Vec<_> = dicts
+            .iter()
+            .map(|d| {
+                let mut walk = d.search_shortest_first(automaton).peekable_levels();
+                let peeked = walk.next_level();
+                (peeked, walk)
+            })
+            .collect();
+        let mut kept: Vec<Vec<u8>> = Vec::new();
+        while kept.len() < cap {
+            let Some(level) = walkers
+                .iter()
+                .filter_map(|(p, _)| p.as_ref().map(|(lvl, _)| *lvl))
+                .min()
+            else {
+                break; // every segment exhausted
+            };
+            // merge this level across segments, summing document counts
+            let mut doc_freq: HashMap<Vec<u8>, u64> = HashMap::new();
+            for (peeked, walk) in walkers.iter_mut() {
+                if peeked.as_ref().is_some_and(|(lvl, _)| *lvl == level) {
+                    let (_, batch) = peeked.take().unwrap();
+                    for (key, info) in batch {
+                        *doc_freq.entry(key).or_insert(0) += info.doc_freq as u64;
+                    }
+                    *peeked = walk.next_level();
+                }
+            }
+            let room = cap - kept.len();
+            if doc_freq.len() <= room {
+                kept.extend(doc_freq.into_keys());
+            } else {
+                let mut level_terms: Vec<(std::cmp::Reverse<u64>, Vec<u8>)> = doc_freq
+                    .into_iter()
+                    .map(|(k, df)| (std::cmp::Reverse(df), k))
+                    .collect();
+                level_terms.sort_unstable();
+                kept.extend(level_terms.into_iter().take(room).map(|(_, k)| k));
+            }
+        }
+        kept
+    }
+
+    #[cfg(feature = "quickwit")]
+    fn cap_shortest_first(&self, dicts: &[&TermDictionary], cap: usize) -> Vec<Vec<u8>> {
+        self.cap_full_walk(dicts, cap).unwrap_or_default()
+    }
+
+    /// Full walk of every dict, then sort by (rank, shortest, most frequent,
+    /// bytes) and keep `cap`.
+    fn cap_full_walk(&self, dicts: &[&TermDictionary], cap: usize) -> io::Result<Vec<Vec<u8>>> {
+        let mut doc_freq: HashMap<Vec<u8>, u64> = HashMap::new();
+        for dict in dicts {
+            let mut stream = self.automaton_stream_with_keys(dict)?;
             while stream.advance() {
                 *doc_freq.entry(stream.key().to_vec()).or_insert(0) +=
                     stream.value().doc_freq as u64;
             }
         }
-        if doc_freq.len() <= cap {
-            return Ok(()); // fits: every segment keeps everything it matches
-        }
         let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u64>, Vec<u8>)> = doc_freq
             .into_iter()
             .map(|(key, df)| {
                 let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
-                (rank, key.len(), std::cmp::Reverse(df), key)
+                let chars = key.iter().filter(|&&b| b & 0xC0 != 0x80 && b != b'"').count();
+                (rank, chars, std::cmp::Reverse(df), key)
             })
             .collect();
-        // rank, then shortest, then most frequent, then byte order: deterministic
         ranked.sort_unstable();
         ranked.truncate(cap);
-        self.allowed_terms = Some(Arc::new(ranked.into_iter().map(|e| e.3).collect()));
-        Ok(())
+        Ok(ranked.into_iter().map(|e| e.3).collect())
     }
 
     /// Every term the automaton matches in `term_dict`, capped and reported
-    /// to the sink as configured. Keys are only materialized when the sink
-    /// or the cap needs them.
+    /// to the sink as configured.
     fn matched_terms(&self, term_dict: &TermDictionary) -> io::Result<Vec<TermInfo>> {
+        // Cap chosen globally: look the kept terms up directly, no re-walk.
         if let Some(allowed) = &self.allowed_terms {
-            // Global cap already chosen: keep exactly those terms.
-            let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
-            let mut infos = Vec::new();
+            let mut infos = Vec::with_capacity(allowed.len());
             let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
-            while term_stream.advance() {
-                let key = term_stream.key();
-                if allowed.contains(key) {
+            for key in allowed.iter() {
+                if let Some(info) = term_dict.get(key)? {
                     if let Some(sink) = sink.as_mut() {
-                        sink.insert(key.to_vec());
+                        sink.insert(key.clone());
                     }
-                    infos.push(term_stream.value().clone());
+                    infos.push(info);
                 }
             }
             return Ok(infos);
         }
-        let need_keys = self.matched_terms_sink.is_some() || self.max_expansions.is_some();
-        if !need_keys {
-            let mut term_stream = self.automaton_stream(term_dict)?;
+        // Cap without a searcher: choose per segment, same rules.
+        if let Some(cap) = self.max_expansions {
+            let kept = if self.uses_shortest_first_walk() {
+                self.cap_shortest_first(&[term_dict], cap)
+            } else {
+                self.cap_full_walk(&[term_dict], cap)?
+            };
+            let mut infos = Vec::with_capacity(kept.len());
+            let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
+            for key in kept {
+                if let Some(info) = term_dict.get(&key)? {
+                    infos.push(info);
+                    if let Some(sink) = sink.as_mut() {
+                        sink.insert(key);
+                    }
+                }
+            }
+            return Ok(infos);
+        }
+        // No cap: the plain stream (keys only when a sink wants them).
+        if let Some(sink) = &self.matched_terms_sink {
+            let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
             let mut infos = Vec::new();
+            let mut guard = sink.lock();
             while term_stream.advance() {
+                guard.insert(term_stream.key().to_vec());
                 infos.push(term_stream.value().clone());
             }
             return Ok(infos);
         }
-
-        let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
-        let mut matched: Vec<(Vec<u8>, TermInfo)> = Vec::new();
+        let mut term_stream = self.automaton_stream(term_dict)?;
+        let mut infos = Vec::new();
         while term_stream.advance() {
-            matched.push((term_stream.key().to_vec(), term_stream.value().clone()));
+            infos.push(term_stream.value().clone());
         }
-
-        if let Some(cap) = self.max_expansions {
-            if matched.len() > cap {
-                let mut order: Vec<(u32, usize, std::cmp::Reverse<u32>, usize)> = matched
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, (key, info))| {
-                        let rank = self.expansion_rank.as_ref().map(|r| r(key)).unwrap_or(0);
-                        (rank, key.len(), std::cmp::Reverse(info.doc_freq), ordinal)
-                    })
-                    .collect();
-                order.sort_unstable();
-                let mut keep: Vec<usize> = order[..cap].iter().map(|o| o.3).collect();
-                keep.sort_unstable();
-                let mut kept = Vec::with_capacity(cap);
-                let mut drained = matched.into_iter().enumerate();
-                for want in keep {
-                    for (i, entry) in drained.by_ref() {
-                        if i == want {
-                            kept.push(entry);
-                            break;
-                        }
-                    }
-                }
-                matched = kept;
-            }
-        }
-
-        if let Some(sink) = &self.matched_terms_sink {
-            let mut guard = sink.lock();
-            for (key, _) in &matched {
-                guard.insert(key.clone());
-            }
-        }
-        Ok(matched.into_iter().map(|(_, info)| info).collect())
+        Ok(infos)
     }
 
     fn automaton_stream<'a>(
