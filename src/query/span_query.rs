@@ -33,10 +33,6 @@ use crate::query::{
 use crate::schema::{Field, IndexRecordOption, Term};
 use crate::{DocId, Score};
 
-/// Default cap on the total number of terms all slots may expand to, per
-/// segment (FtsLib caps expansions at 2000 per group).
-pub const DEFAULT_SPAN_MAX_EXPANSIONS: u32 = 1 << 14;
-
 /// A source of terms for one span slot: anything that can list, for a
 /// segment, the term infos it matches.
 pub trait SpanTermSource: Send + Sync + 'static {
@@ -84,7 +80,6 @@ pub struct SpanQuery {
     /// `gaps[i]` = max words between slot i and slot i+1.
     gaps: Vec<u32>,
     ordered: bool,
-    max_expansions: u32,
 }
 
 impl std::fmt::Debug for SpanQuery {
@@ -106,7 +101,6 @@ impl SpanQuery {
             slots: vec![first_slot],
             gaps: Vec::new(),
             ordered: true,
-            max_expansions: DEFAULT_SPAN_MAX_EXPANSIONS,
         }
     }
 
@@ -124,11 +118,6 @@ impl SpanQuery {
         self.ordered = ordered;
     }
 
-    /// Caps the total number of terms all slots may expand to per segment;
-    /// exceeding it is an error.
-    pub fn set_max_expansions(&mut self, max_expansions: u32) {
-        self.max_expansions = max_expansions;
-    }
 }
 
 impl Query for SpanQuery {
@@ -150,7 +139,6 @@ impl Query for SpanQuery {
             slots: self.slots.clone(),
             gaps: self.gaps.clone(),
             ordered: self.ordered,
-            max_expansions: self.max_expansions,
         }))
     }
 }
@@ -160,7 +148,6 @@ struct SpanWeight {
     slots: Vec<Arc<dyn SpanTermSource>>,
     gaps: Vec<u32>,
     ordered: bool,
-    max_expansions: u32,
 }
 
 type SlotPostings = crate::query::union::SimpleUnion<Box<dyn Postings + 'static>>;
@@ -168,18 +155,13 @@ type SlotPostings = crate::query::union::SimpleUnion<Box<dyn Postings + 'static>
 impl SpanWeight {
     fn span_scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Option<SpanScorer>> {
         let inverted_index = reader.inverted_index(self.field)?;
+        // Expansion caps are each slot's own business (an AutomatonWeight
+        // slot caps by rank); a span never fails for being broad.
         let mut slots = Vec::with_capacity(self.slots.len());
-        let mut num_terms = 0usize;
         for slot in &self.slots {
             let term_infos = slot.match_term_infos(reader)?;
             if term_infos.is_empty() {
                 return Ok(None); // a slot with no terms can't match
-            }
-            num_terms += term_infos.len();
-            if num_terms > self.max_expansions as usize {
-                return Err(crate::TantivyError::InvalidArgument(format!(
-                    "Span query exceeded max expansions {num_terms}"
-                )));
             }
             slots.push(RegexPhraseWeight::get_union_from_term_infos(
                 &term_infos,

@@ -66,20 +66,16 @@ impl RegexPhraseWeight {
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let mut posting_lists = Vec::new();
         let inverted_index = reader.inverted_index(self.field)?;
-        let mut num_terms = 0;
         for &(offset, ref regex) in &self.phrase_terms {
-            let automaton: AutomatonWeight<Regex> =
+            let mut automaton: AutomatonWeight<Regex> =
                 AutomatonWeight::new(self.field, Arc::clone(regex));
+            // Cap per slot rather than fail the query: the shortest, most
+            // frequent matches are kept (FtsLib's wildcard rule).
+            automaton.set_max_expansions(self.max_expansions as usize);
             let term_infos = automaton.get_match_term_infos(reader)?;
             // If term_infos is empty, the phrase can not match any documents.
             if term_infos.is_empty() {
                 return Ok(None);
-            }
-            num_terms += term_infos.len();
-            if num_terms > self.max_expansions as usize {
-                return Err(crate::TantivyError::InvalidArgument(format!(
-                    "Phrase query exceeded max expansions {num_terms}"
-                )));
             }
             let union = Self::get_union_from_term_infos(&term_infos, reader, &inverted_index)?;
 

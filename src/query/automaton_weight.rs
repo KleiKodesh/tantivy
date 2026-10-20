@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -80,6 +80,10 @@ impl fmt::Debug for MatchedTermsSink {
     }
 }
 
+/// Ranks a matched term for expansion capping: lower is better (e.g. the
+/// edit distance of a fuzzy match). See [`AutomatonWeight::set_max_expansions`].
+pub type ExpansionRank = Arc<dyn Fn(&[u8]) -> u32 + Send + Sync>;
+
 /// A weight struct for Fuzzy Term and Regex Queries
 pub struct AutomatonWeight<A> {
     field: Field,
@@ -91,6 +95,15 @@ pub struct AutomatonWeight<A> {
     // When set, the terms matched by the automaton walk are copied into this
     // sink as `scorer()` streams them. `None` keeps the key-less fast path.
     matched_terms_sink: Option<MatchedTermsSink>,
+    // When set, at most this many matched terms are used per segment; the
+    // rest are dropped by rank (see `matched_terms`). `None` = unlimited.
+    max_expansions: Option<usize>,
+    // Primary sort key for capping; `None` ranks every term 0.
+    expansion_rank: Option<ExpansionRank>,
+    // The capped term set, chosen once over the whole index by
+    // `apply_global_cap`. When set, every segment uses exactly these terms;
+    // when absent, the cap falls back to per segment.
+    allowed_terms: Option<Arc<HashSet<Vec<u8>>>>,
 }
 
 impl<A> AutomatonWeight<A>
@@ -105,6 +118,9 @@ where
             automaton: automaton.into(),
             json_path_bytes: None,
             matched_terms_sink: None,
+            max_expansions: None,
+            expansion_rank: None,
+            allowed_terms: None,
         }
     }
 
@@ -119,6 +135,9 @@ where
             automaton: automaton.into(),
             json_path_bytes: Some(json_path_bytes.to_vec().into_boxed_slice()),
             matched_terms_sink: None,
+            max_expansions: None,
+            expansion_rank: None,
+            allowed_terms: None,
         }
     }
 
@@ -126,6 +145,128 @@ where
     /// is built (once per segment). See [`MatchedTermsSink`].
     pub fn set_matched_terms_sink(&mut self, sink: MatchedTermsSink) {
         self.matched_terms_sink = Some(sink);
+    }
+
+    /// Caps the expansion: when the automaton matches more than `cap` terms
+    /// in a segment, only the best `cap` are used (and reported to the
+    /// sink). Best = lowest [`ExpansionRank`] (0 when none is set), then the
+    /// shortest term, then the higher document count, then dictionary
+    /// order; this is FtsLib's wildcard/fuzzy cap rule. The walk itself is
+    /// not cut short, so the choice is deterministic and does not depend on
+    /// dictionary order alone.
+    pub fn set_max_expansions(&mut self, cap: usize) {
+        self.max_expansions = Some(cap);
+    }
+
+    /// The primary key the cap sorts by (e.g. a fuzzy match's edit distance).
+    pub fn set_expansion_rank(&mut self, rank: ExpansionRank) {
+        self.expansion_rank = Some(rank);
+    }
+
+    /// Chooses the capped term set ONCE over every segment of `searcher`
+    /// (document counts summed across segments), so all segments use the same
+    /// terms, as FtsLib's single term index does. Without this call the cap
+    /// is applied per segment. No-op when no cap is set or the expansion fits.
+    pub fn apply_global_cap(&mut self, searcher: &crate::Searcher) -> crate::Result<()> {
+        let Some(cap) = self.max_expansions else {
+            return Ok(());
+        };
+        let mut doc_freq: HashMap<Vec<u8>, u64> = HashMap::new();
+        for segment in searcher.segment_readers() {
+            let inverted_index = segment.inverted_index(self.field)?;
+            let mut stream = self.automaton_stream_with_keys(inverted_index.terms())?;
+            while stream.advance() {
+                *doc_freq.entry(stream.key().to_vec()).or_insert(0) +=
+                    stream.value().doc_freq as u64;
+            }
+        }
+        if doc_freq.len() <= cap {
+            return Ok(()); // fits: every segment keeps everything it matches
+        }
+        let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u64>, Vec<u8>)> = doc_freq
+            .into_iter()
+            .map(|(key, df)| {
+                let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
+                (rank, key.len(), std::cmp::Reverse(df), key)
+            })
+            .collect();
+        // rank, then shortest, then most frequent, then byte order: deterministic
+        ranked.sort_unstable();
+        ranked.truncate(cap);
+        self.allowed_terms = Some(Arc::new(ranked.into_iter().map(|e| e.3).collect()));
+        Ok(())
+    }
+
+    /// Every term the automaton matches in `term_dict`, capped and reported
+    /// to the sink as configured. Keys are only materialized when the sink
+    /// or the cap needs them.
+    fn matched_terms(&self, term_dict: &TermDictionary) -> io::Result<Vec<TermInfo>> {
+        if let Some(allowed) = &self.allowed_terms {
+            // Global cap already chosen: keep exactly those terms.
+            let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
+            let mut infos = Vec::new();
+            let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
+            while term_stream.advance() {
+                let key = term_stream.key();
+                if allowed.contains(key) {
+                    if let Some(sink) = sink.as_mut() {
+                        sink.insert(key.to_vec());
+                    }
+                    infos.push(term_stream.value().clone());
+                }
+            }
+            return Ok(infos);
+        }
+        let need_keys = self.matched_terms_sink.is_some() || self.max_expansions.is_some();
+        if !need_keys {
+            let mut term_stream = self.automaton_stream(term_dict)?;
+            let mut infos = Vec::new();
+            while term_stream.advance() {
+                infos.push(term_stream.value().clone());
+            }
+            return Ok(infos);
+        }
+
+        let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
+        let mut matched: Vec<(Vec<u8>, TermInfo)> = Vec::new();
+        while term_stream.advance() {
+            matched.push((term_stream.key().to_vec(), term_stream.value().clone()));
+        }
+
+        if let Some(cap) = self.max_expansions {
+            if matched.len() > cap {
+                let mut order: Vec<(u32, usize, std::cmp::Reverse<u32>, usize)> = matched
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, (key, info))| {
+                        let rank = self.expansion_rank.as_ref().map(|r| r(key)).unwrap_or(0);
+                        (rank, key.len(), std::cmp::Reverse(info.doc_freq), ordinal)
+                    })
+                    .collect();
+                order.sort_unstable();
+                let mut keep: Vec<usize> = order[..cap].iter().map(|o| o.3).collect();
+                keep.sort_unstable();
+                let mut kept = Vec::with_capacity(cap);
+                let mut drained = matched.into_iter().enumerate();
+                for want in keep {
+                    for (i, entry) in drained.by_ref() {
+                        if i == want {
+                            kept.push(entry);
+                            break;
+                        }
+                    }
+                }
+                matched = kept;
+            }
+        }
+
+        if let Some(sink) = &self.matched_terms_sink {
+            let mut guard = sink.lock();
+            for (key, _) in &matched {
+                guard.insert(key.clone());
+            }
+        }
+        Ok(matched.into_iter().map(|(_, info)| info).collect())
     }
 
     fn automaton_stream<'a>(
@@ -167,26 +308,11 @@ where
 
     /// Returns the term infos that match the automaton
     ///
-    /// If a [`MatchedTermsSink`] is attached, the matched terms are also
-    /// copied into it.
+    /// Honors the expansion cap; if a [`MatchedTermsSink`] is attached, the
+    /// (kept) matched terms are also copied into it.
     pub fn get_match_term_infos(&self, reader: &SegmentReader) -> crate::Result<Vec<TermInfo>> {
         let inverted_index = reader.inverted_index(self.field)?;
-        let term_dict = inverted_index.terms();
-        let mut term_infos = Vec::new();
-        if let Some(sink) = &self.matched_terms_sink {
-            let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
-            let mut matched = sink.lock();
-            while term_stream.advance() {
-                matched.insert(term_stream.key().to_vec());
-                term_infos.push(term_stream.value().clone());
-            }
-        } else {
-            let mut term_stream = self.automaton_stream(term_dict)?;
-            while term_stream.advance() {
-                term_infos.push(term_stream.value().clone());
-            }
-        }
-        Ok(term_infos)
+        Ok(self.matched_terms(inverted_index.terms())?)
     }
 
     /// The field this weight searches.
@@ -205,9 +331,9 @@ where
         let mut doc_bitset = BitSet::with_max_value(max_doc);
         let inverted_index = reader.inverted_index(self.field)?;
         let term_dict = inverted_index.terms();
-        let mut collect_postings = |term_info: &TermInfo| -> crate::Result<()> {
+        for term_info in self.matched_terms(term_dict)? {
             let mut block_segment_postings = inverted_index
-                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)?;
+                .read_block_postings_from_terminfo(&term_info, IndexRecordOption::Basic)?;
             loop {
                 let docs = block_segment_postings.docs();
                 if docs.is_empty() {
@@ -217,22 +343,6 @@ where
                     doc_bitset.insert(doc);
                 }
                 block_segment_postings.advance();
-            }
-            Ok(())
-        };
-        if let Some(sink) = &self.matched_terms_sink {
-            // Keyed walk: same traversal, plus one copy of each matched
-            // term's bytes into the sink. One lock per segment.
-            let mut term_stream = self.automaton_stream_with_keys(term_dict)?;
-            let mut matched = sink.lock();
-            while term_stream.advance() {
-                matched.insert(term_stream.key().to_vec());
-                collect_postings(term_stream.value())?;
-            }
-        } else {
-            let mut term_stream = self.automaton_stream(term_dict)?;
-            while term_stream.advance() {
-                collect_postings(term_stream.value())?;
             }
         }
         let doc_bitset = BitSetDocSet::from(doc_bitset);
@@ -343,6 +453,49 @@ mod tests {
         // ...plus the matched words, and only the matched words.
         assert_eq!(sink.take_strings(), vec!["abc".to_string(), "abcd".to_string()]);
         assert!(sink.is_empty(), "take_strings drains the sink");
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_max_expansions_keeps_shortest() -> crate::Result<()> {
+        // "abc" and "abcd" both match; cap 1 keeps the shorter "abc" only
+        let index = create_index()?;
+        let field = index.schema().get_field("title").unwrap();
+        let mut automaton_weight = AutomatonWeight::new(field, PrefixedByA);
+        let sink = super::MatchedTermsSink::new();
+        automaton_weight.set_matched_terms_sink(sink.clone());
+        automaton_weight.set_max_expansions(1);
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        assert_eq!(scorer.doc(), 0u32); // "abc"
+        assert_eq!(scorer.advance(), TERMINATED); // "abcd" (doc 2) dropped
+        assert_eq!(sink.take_strings(), vec!["abc".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_max_expansions_rank_first() -> crate::Result<()> {
+        // a rank that prefers "abcd" overrides the shortest-first tie rule
+        let index = create_index()?;
+        let field = index.schema().get_field("title").unwrap();
+        let mut automaton_weight = AutomatonWeight::new(field, PrefixedByA);
+        let sink = super::MatchedTermsSink::new();
+        automaton_weight.set_matched_terms_sink(sink.clone());
+        automaton_weight.set_max_expansions(1);
+        automaton_weight.set_expansion_rank(std::sync::Arc::new(|key: &[u8]| {
+            if key == b"abcd" {
+                0
+            } else {
+                1
+            }
+        }));
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        assert_eq!(scorer.doc(), 2u32);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(sink.take_strings(), vec!["abcd".to_string()]);
         Ok(())
     }
 

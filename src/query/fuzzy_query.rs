@@ -93,6 +93,9 @@ pub struct FuzzyTermQuery {
     /// When set, every term the automaton matches in the term dictionary is
     /// copied into this sink as the search runs.
     matched_terms_sink: Option<MatchedTermsSink>,
+    /// When set, at most this many matched terms are used per segment,
+    /// closest (edit distance) first, then shortest, then most frequent.
+    max_expansions: Option<usize>,
 }
 
 impl FuzzyTermQuery {
@@ -104,6 +107,7 @@ impl FuzzyTermQuery {
             transposition_cost_one,
             prefix: false,
             matched_terms_sink: None,
+            max_expansions: None,
         }
     }
 
@@ -115,6 +119,14 @@ impl FuzzyTermQuery {
         self.matched_terms_sink = Some(sink);
     }
 
+    /// Caps the expansion at `cap` terms per segment: the closest matches
+    /// (by edit distance) win, then the shortest, then the most frequent.
+    /// Never an error; the walk still runs in full so the choice is
+    /// deterministic.
+    pub fn set_max_expansions(&mut self, cap: usize) {
+        self.max_expansions = Some(cap);
+    }
+
     /// Creates a new Fuzzy Query of the Term prefix
     pub fn new_prefix(term: Term, distance: u8, transposition_cost_one: bool) -> FuzzyTermQuery {
         FuzzyTermQuery {
@@ -123,6 +135,7 @@ impl FuzzyTermQuery {
             transposition_cost_one,
             prefix: true,
             matched_terms_sink: None,
+            max_expansions: None,
         }
     }
 
@@ -193,22 +206,35 @@ impl FuzzyTermQuery {
     }
 
     fn specialized_weight(&self) -> crate::Result<AutomatonWeight<DfaWrapper>> {
-        let automaton = self.automaton()?;
+        let automaton = std::sync::Arc::new(self.automaton()?);
         let mut weight = if let Some((json_path_bytes, _)) = self.term.value().as_json() {
-            AutomatonWeight::new_for_json_path(self.term.field(), automaton, json_path_bytes)
+            AutomatonWeight::new_for_json_path(self.term.field(), automaton.clone(), json_path_bytes)
         } else {
-            AutomatonWeight::new(self.term.field(), automaton)
+            AutomatonWeight::new(self.term.field(), automaton.clone())
         };
         if let Some(sink) = &self.matched_terms_sink {
             weight.set_matched_terms_sink(sink.clone());
+        }
+        if let Some(cap) = self.max_expansions {
+            weight.set_max_expansions(cap);
+            // Closest first: the DFA's edit distance of the matched term.
+            weight.set_expansion_rank(std::sync::Arc::new(move |key: &[u8]| {
+                match automaton.0.eval(key) {
+                    Distance::Exact(d) | Distance::AtLeast(d) => d as u32,
+                }
+            }));
         }
         Ok(weight)
     }
 }
 
 impl Query for FuzzyTermQuery {
-    fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(self.specialized_weight()?))
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        let mut weight = self.specialized_weight()?;
+        if let Some(searcher) = enable_scoring.searcher() {
+            weight.apply_global_cap(searcher)?;
+        }
+        Ok(Box::new(weight))
     }
 }
 
@@ -356,6 +382,26 @@ mod test {
             assert_eq!(top_docs.len(), 1, "Expected only 1 document");
             let (score, _) = top_docs[0];
             assert_nearly_equals!(1.0, score);
+        }
+
+        // a cap keeps the closest matches: distance 0 "japan" over distance 1
+        // "japon" — chosen over the WHOLE index, even though "japon" sits alone
+        // in its own segment
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            index_writer.add_document(doc!(country_field => "japon"))?;
+            index_writer.commit()?;
+            let searcher = index.reader()?.searcher();
+            assert_eq!(searcher.segment_readers().len(), 2, "test needs two segments");
+            let term = Term::from_field_text(country_field, "japan");
+            let mut fuzzy_query = FuzzyTermQuery::new(term, 1, true);
+            let sink = crate::query::MatchedTermsSink::new();
+            fuzzy_query.set_matched_terms_sink(sink.clone());
+            fuzzy_query.set_max_expansions(1);
+            let top_docs =
+                searcher.search(&fuzzy_query, &TopDocs::with_limit(5).order_by_score())?;
+            assert_eq!(top_docs.len(), 1, "only the closest term's docs");
+            assert_eq!(sink.take_strings(), vec!["japan".to_string()]);
         }
 
         // with a sink attached, the search also reports the words the fuzzy

@@ -60,6 +60,9 @@ pub struct RegexQuery {
     /// When set, every term the regex matches in the term dictionary is
     /// copied into this sink as the search runs.
     matched_terms_sink: Option<MatchedTermsSink>,
+    /// When set, at most this many matched terms are used per segment,
+    /// shortest first, then most frequent.
+    max_expansions: Option<usize>,
 }
 
 impl RegexQuery {
@@ -76,6 +79,7 @@ impl RegexQuery {
             regex: regex.into(),
             field,
             matched_terms_sink: None,
+            max_expansions: None,
         }
     }
 
@@ -87,18 +91,31 @@ impl RegexQuery {
         self.matched_terms_sink = Some(sink);
     }
 
+    /// Caps the expansion at `cap` terms per segment: the shortest matches
+    /// win, then the most frequent (FtsLib's wildcard rule). Never an error.
+    pub fn set_max_expansions(&mut self, cap: usize) {
+        self.max_expansions = Some(cap);
+    }
+
     fn specialized_weight(&self) -> AutomatonWeight<Regex> {
         let mut weight = AutomatonWeight::new(self.field, self.regex.clone());
         if let Some(sink) = &self.matched_terms_sink {
             weight.set_matched_terms_sink(sink.clone());
+        }
+        if let Some(cap) = self.max_expansions {
+            weight.set_max_expansions(cap);
         }
         weight
     }
 }
 
 impl Query for RegexQuery {
-    fn weight(&self, _enabled_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(self.specialized_weight()))
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        let mut weight = self.specialized_weight();
+        if let Some(searcher) = enable_scoring.searcher() {
+            weight.apply_global_cap(searcher)?;
+        }
+        Ok(Box::new(weight))
     }
 }
 
