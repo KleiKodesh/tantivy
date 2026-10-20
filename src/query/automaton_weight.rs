@@ -190,20 +190,49 @@ where
         let automaton: &A = &self.automaton;
         let mut walk = dict.search_shortest_first(automaton, self.zero_width);
         let mut kept: Vec<Vec<u8>> = Vec::new();
-        while kept.len() < cap {
+        if self.zero_width.is_empty() {
+            while kept.len() < cap {
+                let Some((_, level)) = walk.next_level()? else {
+                    break;
+                };
+                let room = cap - kept.len();
+                if level.len() <= room {
+                    kept.extend(level.into_iter().map(|(key, _)| key));
+                } else {
+                    let mut level_terms: Vec<(std::cmp::Reverse<u32>, Vec<u8>)> = level
+                        .into_iter()
+                        .map(|(key, info)| (std::cmp::Reverse(info.doc_freq), key))
+                        .collect();
+                    level_terms.sort_unstable();
+                    kept.extend(level_terms.into_iter().take(room).map(|(_, key)| key));
+                }
+            }
+            return Ok(kept);
+        }
+        // With zero-width bytes, terms that differ only in them (a word and
+        // its forms with an intra-word quote) are ONE slot under the cap,
+        // ranked by their summed doc count; all of a kept slot's terms are
+        // used. They always share a level: zero-width bytes do not count
+        // towards the length the walk orders by.
+        let mut slots = 0usize;
+        while slots < cap {
             let Some((_, level)) = walk.next_level()? else {
                 break;
             };
-            let room = cap - kept.len();
-            if level.len() <= room {
-                kept.extend(level.into_iter().map(|(key, _)| key));
+            let groups = group_by_stripped(level, self.zero_width);
+            let room = cap - slots;
+            if groups.len() <= room {
+                slots += groups.len();
+                kept.extend(groups.into_iter().flat_map(|g| g.terms));
             } else {
-                let mut level_terms: Vec<(std::cmp::Reverse<u32>, Vec<u8>)> = level
-                    .into_iter()
-                    .map(|(key, info)| (std::cmp::Reverse(info.doc_freq), key))
-                    .collect();
-                level_terms.sort_unstable();
-                kept.extend(level_terms.into_iter().take(room).map(|(_, key)| key));
+                let mut groups = groups;
+                groups.sort_unstable_by(|a, b| {
+                    b.doc_freq
+                        .cmp(&a.doc_freq)
+                        .then_with(|| a.stripped.cmp(&b.stripped))
+                });
+                slots += room;
+                kept.extend(groups.into_iter().take(room).flat_map(|g| g.terms));
             }
         }
         Ok(kept)
@@ -213,16 +242,43 @@ where
     /// bytes) and keep `cap`.
     fn cap_full_walk(&self, dict: &TermDictionary, cap: usize) -> io::Result<Vec<Vec<u8>>> {
         let mut stream = self.automaton_stream_with_keys(dict)?;
-        let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u32>, Vec<u8>)> = Vec::new();
+        if self.zero_width.is_empty() {
+            let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u32>, Vec<u8>)> = Vec::new();
+            while stream.advance() {
+                let key = stream.key().to_vec();
+                let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
+                let chars = self.zero_width.term_len(&key);
+                ranked.push((rank, chars, std::cmp::Reverse(stream.value().doc_freq), key));
+            }
+            ranked.sort_unstable();
+            ranked.truncate(cap);
+            return Ok(ranked.into_iter().map(|e| e.3).collect());
+        }
+        // One slot per zero-width-stripped form (see `cap_shortest_first`):
+        // the slot's rank is its best member's, its doc count the sum.
+        let mut by_form: std::collections::HashMap<Vec<u8>, (u32, usize, u64, Vec<Vec<u8>>)> =
+            std::collections::HashMap::new();
         while stream.advance() {
             let key = stream.key().to_vec();
             let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
             let chars = self.zero_width.term_len(&key);
-            ranked.push((rank, chars, std::cmp::Reverse(stream.value().doc_freq), key));
+            let form = self.zero_width.strip(&key).into_owned();
+            let slot = by_form
+                .entry(form)
+                .or_insert((u32::MAX, chars, 0, Vec::new()));
+            slot.0 = slot.0.min(rank);
+            slot.2 += u64::from(stream.value().doc_freq);
+            slot.3.push(key);
         }
-        ranked.sort_unstable();
-        ranked.truncate(cap);
-        Ok(ranked.into_iter().map(|e| e.3).collect())
+        let mut slots: Vec<(u32, usize, std::cmp::Reverse<u64>, Vec<u8>, Vec<Vec<u8>>)> = by_form
+            .into_iter()
+            .map(|(form, (rank, chars, df, terms))| {
+                (rank, chars, std::cmp::Reverse(df), form, terms)
+            })
+            .collect();
+        slots.sort_unstable_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
+        slots.truncate(cap);
+        Ok(slots.into_iter().flat_map(|s| s.4).collect())
     }
 
     /// Every term the automaton matches in `term_dict`, capped and reported
@@ -358,6 +414,38 @@ where
     }
 }
 
+/// The terms of one shortest-first level that share a zero-width-stripped
+/// form: one expansion slot under a cap.
+struct StrippedGroup {
+    stripped: Vec<u8>,
+    doc_freq: u64,
+    terms: Vec<Vec<u8>>,
+}
+
+/// Groups a level's terms by their zero-width-stripped form, keeping the
+/// level's byte order of first appearance.
+fn group_by_stripped(
+    level: Vec<(Vec<u8>, TermInfo)>,
+    zero_width: crate::termdict::ZeroWidthBytes,
+) -> Vec<StrippedGroup> {
+    let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<StrippedGroup> = Vec::new();
+    for (key, info) in level {
+        let stripped = zero_width.strip(&key).into_owned();
+        let at = *index.entry(stripped.clone()).or_insert_with(|| {
+            groups.push(StrippedGroup {
+                stripped,
+                doc_freq: 0,
+                terms: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        groups[at].doc_freq += u64::from(info.doc_freq);
+        groups[at].terms.push(key);
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use tantivy_fst::Automaton;
@@ -476,8 +564,8 @@ mod tests {
     #[test]
     fn test_automaton_weight_max_expansions_zero_width_bytes() -> crate::Result<()> {
         // "abc" (3 chars) and "a\"bc" (4 chars, 3 with a zero-width quote) both
-        // match; cap 1 keeps the shorter, and with the quote zero-width the
-        // tie breaks on byte order ('"' < 'b')
+        // match; cap 1 keeps the shorter. With the quote zero-width they are
+        // the same form ("abc"), so they share the one slot and both are kept
         let mut schema = Schema::builder();
         let title = schema.add_text_field("title", STRING);
         let index = Index::create_in_ram(schema.build());
@@ -499,9 +587,56 @@ mod tests {
 
         automaton_weight.set_zero_width_bytes(crate::termdict::ZeroWidthBytes::new(b"\""));
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
-        assert_eq!(scorer.doc(), 1u32);
+        assert_eq!(scorer.doc(), 0u32);
+        assert_eq!(scorer.advance(), 1u32);
         assert_eq!(scorer.advance(), TERMINATED);
-        assert_eq!(sink.take_strings(), vec!["a\"bc".to_string()]);
+        assert_eq!(
+            sink.take_strings(),
+            vec!["a\"bc".to_string(), "abc".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_zero_width_variants_share_one_slot() -> crate::Result<()> {
+        // Level of 3-char forms: "abc" (+ its variant "a\"bc"), "abd", "abe".
+        // With cap 2, the variants count as ONE slot: the cut keeps "abc"
+        // (with "a\"bc") and the more frequent of "abd" / "abe", instead of
+        // spending a second slot on the quoted duplicate. Their summed doc
+        // count ranks the "abc" form first.
+        let mut schema = Schema::builder();
+        let title = schema.add_text_field("title", STRING);
+        let index = Index::create_in_ram(schema.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        for t in ["abc", "a\"bc", "abd", "abd", "abe"] {
+            index_writer.add_document(doc!(title=>t))?;
+        }
+        index_writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let mut automaton_weight = AutomatonWeight::new(title, PrefixedByA);
+        let sink = super::MatchedTermsSink::new();
+        automaton_weight.set_matched_terms_sink(sink.clone());
+        automaton_weight.set_max_expansions(2);
+        automaton_weight.set_zero_width_bytes(crate::termdict::ZeroWidthBytes::new(b"\""));
+        let _ = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        let mut kept = sink.take_strings();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec!["a\"bc".to_string(), "abc".to_string(), "abd".to_string()]
+        );
+
+        // the full-walk path (a rank is set) groups the same way
+        automaton_weight.set_expansion_rank(std::sync::Arc::new(|_key: &[u8]| 0));
+        let _ = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        let mut kept = sink.take_strings();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec!["a\"bc".to_string(), "abc".to_string(), "abd".to_string()]
+        );
         Ok(())
     }
 

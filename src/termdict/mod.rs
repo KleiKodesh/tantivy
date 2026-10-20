@@ -174,7 +174,9 @@ impl TermDictionary {
     /// Returns a search builder, to stream all of the terms
     /// within the Automaton
     pub fn search<'a, A: Automaton + 'a>(&'a self, automaton: A) -> TermStreamerBuilder<'a, A>
-    where A::State: Clone {
+    where
+        A::State: Clone,
+    {
         self.0.search(automaton)
     }
 
@@ -293,6 +295,17 @@ impl ZeroWidthBytes {
         key.iter()
             .filter(|&&b| b & 0xC0 != 0x80 && !self.contains(b))
             .count()
+    }
+
+    /// The term without its zero-width bytes: terms that differ only in
+    /// zero-width bytes share this form (and therefore one expansion slot
+    /// under a cap, see `AutomatonWeight::set_max_expansions`).
+    pub fn strip<'a>(&self, key: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if self.is_empty() || !key.iter().any(|&b| self.contains(b)) {
+            std::borrow::Cow::Borrowed(key)
+        } else {
+            std::borrow::Cow::Owned(key.iter().copied().filter(|&b| !self.contains(b)).collect())
+        }
     }
 }
 
