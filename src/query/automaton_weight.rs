@@ -238,7 +238,7 @@ where
                     kept.extend(level_terms.into_iter().take(room).map(|(_, key)| key));
                 }
             }
-            if !truncated && kept.len() >= cap {
+            if !truncated && kept.len() >= cap && self.matched_terms_sink.is_some() {
                 truncated = walk.has_more()?;
             }
             return Ok((kept, truncated));
@@ -270,7 +270,7 @@ where
                 kept.extend(groups.into_iter().take(room).flat_map(|g| g.terms));
             }
         }
-        if !truncated && slots >= cap {
+        if !truncated && slots >= cap && self.matched_terms_sink.is_some() {
             truncated = walk.has_more()?;
         }
         Ok((kept, truncated))
