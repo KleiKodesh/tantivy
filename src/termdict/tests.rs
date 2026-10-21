@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::{io, str};
 
-use super::{TermDictionary, TermDictionaryBuilder, TermStreamer, ZeroWidthBytes};
+use super::{TermDictionary, TermDictionaryBuilder, TermStreamer, ZeroWidthChars};
 use crate::directory::{Directory, FileSlice, RamDirectory, TerminatingWrite};
 use crate::postings::TermInfo;
 
@@ -484,26 +484,94 @@ fn test_search_without_keys() {
 }
 
 #[test]
-fn test_zero_width_bytes() {
-    let none = ZeroWidthBytes::NONE;
+fn test_zero_width_chars() {
+    let none = ZeroWidthChars::NONE;
     assert!(none.is_empty());
-    assert!(!none.contains(b'"'));
+    assert!(!none.contains_byte(b'"'));
     assert_eq!(none.term_len("a\"b\u{e9}".as_bytes()), 4);
 
-    let quote = ZeroWidthBytes::new(b"\"'");
+    let quote = ZeroWidthChars::new(b"\"'");
     assert!(!quote.is_empty());
-    assert!(quote.contains(b'"'));
-    assert!(quote.contains(b'\''));
-    assert!(!quote.contains(b'a'));
-    assert!(!quote.contains(0xC3));
+    assert!(quote.contains_byte(b'"'));
+    assert!(quote.contains('\''));
+    assert!(!quote.contains_byte(b'a'));
+    assert!(!quote.contains_byte(0xC3));
+    assert!(!quote.has_multibyte());
     assert_eq!(quote.term_len("a\"b\u{e9}".as_bytes()), 3);
     assert_eq!(quote.term_len(b""), 0);
-    assert_eq!(ZeroWidthBytes::default(), none);
+    assert_eq!(quote.strip(b"a\"b").as_ref(), b"ab");
+    assert_eq!(ZeroWidthChars::default(), none);
+
+    // multi-byte characters by range: combining marks (2 bytes) and a
+    // 3-byte range
+    static RANGES: [(char, char); 2] = [('\u{300}', '\u{36F}'), ('\u{200B}', '\u{200D}')];
+    let marks = ZeroWidthChars::new(b"\"").with_ranges(&RANGES);
+    assert!(marks.has_multibyte() && !marks.is_empty());
+    assert!(marks.contains('\u{301}') && marks.contains('\u{200C}') && marks.contains('"'));
+    assert!(!marks.contains('\u{e9}') && !marks.contains('a'));
+    let term = "e\u{301}t\u{200C}e\"\u{e9}";
+    assert_eq!(marks.term_len(term.as_bytes()), 4);
+    assert_eq!(
+        marks.strip(term.as_bytes()).as_ref(),
+        "ete\u{e9}".as_bytes()
+    );
+    assert!(matches!(marks.strip(b"abc"), std::borrow::Cow::Borrowed(_)));
+    // bytes that are not valid UTF-8 are never zero-width
+    assert_eq!(marks.term_len(&[b'a', 0xCC]), 2);
+    assert_eq!(marks.strip(&[0xCC, 0x81, 0xCC]).as_ref(), &[0xCC]);
+    assert_eq!(
+        ZeroWidthChars::NONE
+            .with_ranges(&RANGES)
+            .term_len("\u{301}".as_bytes()),
+        0
+    );
+}
+
+#[test]
+fn test_search_shortest_first_multibyte_zero_width() -> crate::Result<()> {
+    // a 3-byte zero-width char at the start of a term and two zero-width
+    // chars in a row; a 4-byte char that counts
+    static RANGES: [(char, char); 2] = [('\u{300}', '\u{36F}'), ('\u{200B}', '\u{200D}')];
+    let terms: &[&str] = &["ab", "a\u{200C}\u{301}b", "\u{200C}a", "\u{1F600}"];
+    let buffer: Vec<u8> = {
+        let mut builder = TermDictionaryBuilder::create(Vec::new())?;
+        for (ord, term) in terms.iter().enumerate() {
+            builder.insert(term.as_bytes(), &make_term_info(ord as u64))?;
+        }
+        builder.finish()?
+    };
+    let dict = TermDictionary::open(FileSlice::from(buffer))?;
+    let zero_width = ZeroWidthChars::NONE.with_ranges(&RANGES);
+    let mut walk = dict.search_shortest_first(&tantivy_fst::automaton::AlwaysMatch, zero_width);
+    let mut levels = Vec::new();
+    while let Some((len, level)) = walk.next_level()? {
+        let keys: Vec<String> = level
+            .into_iter()
+            .map(|(key, _)| String::from_utf8(key).unwrap())
+            .collect();
+        levels.push((len, keys));
+    }
+    assert_eq!(
+        levels,
+        vec![
+            (1, vec!["\u{200C}a".to_string(), "\u{1F600}".to_string()]),
+            (2, vec!["ab".to_string(), "a\u{200C}\u{301}b".to_string()]),
+        ]
+    );
+    for term in terms {
+        let expected = if term.starts_with('\u{1F600}') {
+            1
+        } else {
+            term.chars().filter(|c| c.is_ascii()).count()
+        };
+        assert_eq!(zero_width.term_len(term.as_bytes()), expected, "{term:?}");
+    }
+    Ok(())
 }
 
 #[test]
 fn test_search_shortest_first() -> crate::Result<()> {
-    let terms: &[&str] = &["a", "a\"b", "ab", "abc", "\u{e9}"];
+    let terms: &[&str] = &["a", "a\"b", "ab", "abc", "ab\u{301}", "\u{e9}"];
     let buffer: Vec<u8> = {
         let mut builder = TermDictionaryBuilder::create(Vec::new())?;
         for (ord, term) in terms.iter().enumerate() {
@@ -513,7 +581,7 @@ fn test_search_shortest_first() -> crate::Result<()> {
     };
     let dict = TermDictionary::open(FileSlice::from(buffer))?;
 
-    let levels = |zero_width: ZeroWidthBytes| -> io::Result<Vec<(usize, Vec<String>)>> {
+    let levels = |zero_width: ZeroWidthChars| -> io::Result<Vec<(usize, Vec<String>)>> {
         let mut walk = dict.search_shortest_first(&tantivy_fst::automaton::AlwaysMatch, zero_width);
         let mut levels = Vec::new();
         while let Some((len, level)) = walk.next_level()? {
@@ -533,19 +601,43 @@ fn test_search_shortest_first() -> crate::Result<()> {
 
     // every character counts: the quote makes a"b three characters long
     assert_eq!(
-        levels(ZeroWidthBytes::NONE)?,
+        levels(ZeroWidthChars::NONE)?,
         vec![
             (1, vec!["a".to_string(), "\u{e9}".to_string()]),
             (2, vec!["ab".to_string()]),
-            (3, vec!["a\"b".to_string(), "abc".to_string()]),
+            (
+                3,
+                vec![
+                    "a\"b".to_string(),
+                    "abc".to_string(),
+                    "ab\u{301}".to_string()
+                ]
+            ),
         ]
     );
     // a zero-width quote: a"b is as short as ab
     assert_eq!(
-        levels(ZeroWidthBytes::new(b"\""))?,
+        levels(ZeroWidthChars::new(b"\""))?,
         vec![
             (1, vec!["a".to_string(), "\u{e9}".to_string()]),
             (2, vec!["a\"b".to_string(), "ab".to_string()]),
+            (3, vec!["abc".to_string(), "ab\u{301}".to_string()]),
+        ]
+    );
+    // a zero-width combining accent (a multi-byte character) too
+    static COMBINING: [(char, char); 1] = [('\u{300}', '\u{36F}')];
+    assert_eq!(
+        levels(ZeroWidthChars::new(b"\"").with_ranges(&COMBINING))?,
+        vec![
+            (1, vec!["a".to_string(), "\u{e9}".to_string()]),
+            (
+                2,
+                vec![
+                    "a\"b".to_string(),
+                    "ab".to_string(),
+                    "ab\u{301}".to_string()
+                ]
+            ),
             (3, vec!["abc".to_string()]),
         ]
     );

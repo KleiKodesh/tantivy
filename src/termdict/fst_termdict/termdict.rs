@@ -10,7 +10,7 @@ use super::term_info_store::{TermInfoStore, TermInfoStoreWriter};
 use super::{TermStreamer, TermStreamerBuilder};
 use crate::directory::{FileSlice, OwnedBytes};
 use crate::postings::TermInfo;
-use crate::termdict::{TermOrdinal, ZeroWidthBytes};
+use crate::termdict::{TermOrdinal, ZeroWidthChars};
 
 fn convert_fst_error(e: tantivy_fst::Error) -> io::Error {
     io::Error::other(e)
@@ -194,7 +194,7 @@ impl TermDictionary {
     pub fn search_shortest_first<'a, A>(
         &'a self,
         automaton: &'a A,
-        zero_width: ZeroWidthBytes,
+        zero_width: ZeroWidthChars,
     ) -> super::shortest_first::ShortestFirstWalk<'a, A>
     where
         A: Automaton,

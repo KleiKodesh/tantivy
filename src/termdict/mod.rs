@@ -140,7 +140,7 @@ impl TermDictionary {
     }
 
     /// Walks the automaton's matches shortest first, one length level (in
-    /// characters, see [`ZeroWidthBytes`]) at a time. Stop pulling levels
+    /// characters, see [`ZeroWidthChars`]) at a time. Stop pulling levels
     /// when enough terms are collected.
     ///
     /// With the FST dictionary this is a breadth-first walk of the FST and
@@ -151,7 +151,7 @@ impl TermDictionary {
     pub fn search_shortest_first<'a, A>(
         &'a self,
         automaton: &'a A,
-        zero_width: ZeroWidthBytes,
+        zero_width: ZeroWidthChars,
     ) -> ShortestFirstTerms<'a, A>
     where
         A: Automaton,
@@ -247,26 +247,35 @@ impl<W: io::Write> TermDictionaryBuilder<W> {
     }
 }
 
-/// ASCII bytes that do not count towards a term's length in
+/// Characters that do not count towards a term's length in
 /// [`TermDictionary::search_shortest_first`] and the expansion cap of
 /// [`AutomatonWeight`](crate::query::AutomatonWeight): an intra-word mark a
-/// tokenizer keeps inside its terms (an apostrophe, a quote, a hyphen) that
-/// should not make the term "longer" than the same word without it.
+/// tokenizer keeps inside its terms (an apostrophe, a quote, a combining
+/// accent or vowel point) that should not make the term "longer" than the
+/// same word without it.
 ///
-/// Only ASCII bytes can be zero-width: a multi-byte character is always
-/// counted as one.
+/// ASCII bytes are given as a set ([`ZeroWidthChars::new`]); other
+/// characters as inclusive code point ranges
+/// ([`ZeroWidthChars::with_ranges`]). Terms are read as UTF-8: a byte that
+/// does not start a valid character is never zero-width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ZeroWidthBytes([u64; 2]);
+pub struct ZeroWidthChars {
+    ascii: [u64; 2],
+    ranges: &'static [(char, char)],
+}
 
-impl ZeroWidthBytes {
-    /// Every byte counts.
-    pub const NONE: ZeroWidthBytes = ZeroWidthBytes([0; 2]);
+impl ZeroWidthChars {
+    /// Every character counts.
+    pub const NONE: ZeroWidthChars = ZeroWidthChars {
+        ascii: [0; 2],
+        ranges: &[],
+    };
 
     /// The given ASCII bytes are zero-width.
     ///
     /// # Panics
     /// If a byte is not ASCII.
-    pub const fn new(bytes: &[u8]) -> ZeroWidthBytes {
+    pub const fn new(bytes: &[u8]) -> ZeroWidthChars {
         let mut bits = [0u64; 2];
         let mut i = 0;
         while i < bytes.len() {
@@ -275,36 +284,151 @@ impl ZeroWidthBytes {
             bits[(byte >> 6) as usize] |= 1u64 << (byte & 63);
             i += 1;
         }
-        ZeroWidthBytes(bits)
+        ZeroWidthChars {
+            ascii: bits,
+            ranges: &[],
+        }
     }
 
-    /// Whether `byte` is zero-width.
+    /// These inclusive ranges of characters are zero-width too (replacing
+    /// any ranges set before). ASCII characters in them are ignored: use
+    /// [`ZeroWidthChars::new`] for those.
+    ///
+    /// The ranges are `'static` so the set stays `Copy` and can be built in
+    /// a `const`; they are scanned linearly, so keep the list short (a few
+    /// ranges of marks).
+    pub const fn with_ranges(self, ranges: &'static [(char, char)]) -> ZeroWidthChars {
+        ZeroWidthChars {
+            ascii: self.ascii,
+            ranges,
+        }
+    }
+
+    /// Whether the ASCII `byte` is zero-width (always false for a byte of a
+    /// multi-byte character: see [`ZeroWidthChars::contains`]).
     #[inline]
-    pub fn contains(&self, byte: u8) -> bool {
-        byte.is_ascii() && (self.0[(byte >> 6) as usize] >> (byte & 63)) & 1 == 1
+    pub fn contains_byte(&self, byte: u8) -> bool {
+        byte.is_ascii() && (self.ascii[(byte >> 6) as usize] >> (byte & 63)) & 1 == 1
     }
 
-    /// Whether no byte is zero-width.
+    /// Whether the character `c` is zero-width.
+    #[inline]
+    pub fn contains(&self, c: char) -> bool {
+        if c.is_ascii() {
+            return self.contains_byte(c as u8);
+        }
+        self.ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi)
+    }
+
+    /// Whether some multi-byte characters are zero-width.
+    #[inline]
+    pub fn has_multibyte(&self) -> bool {
+        !self.ranges.is_empty()
+    }
+
+    /// Whether no character is zero-width.
     pub fn is_empty(&self) -> bool {
-        self.0 == [0; 2]
+        self.ascii == [0; 2] && self.ranges.is_empty()
+    }
+
+    /// For the UTF-8 character starting at `key[at]` (not ASCII, not a
+    /// continuation byte): whether it is zero-width, and its length in bytes
+    /// (1 when it is not a valid character).
+    #[inline]
+    fn multibyte_at(&self, key: &[u8], at: usize) -> (bool, usize) {
+        let len = match key[at] {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return (false, 1),
+        };
+        let Some(bytes) = key.get(at..at + len) else {
+            return (false, 1);
+        };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => (s.chars().next().is_some_and(|c| self.contains(c)), len),
+            Err(_) => (false, 1),
+        }
+    }
+
+    /// Whether the last `len` bytes of `key`, one complete character, are a
+    /// zero-width character.
+    #[inline]
+    pub(crate) fn ends_with_zero_width(&self, key: &[u8], len: usize) -> bool {
+        if len == 1 {
+            return key.last().is_some_and(|&b| self.contains_byte(b));
+        }
+        self.has_multibyte()
+            && key.len() >= len
+            && self.multibyte_at(key, key.len() - len) == (true, len)
     }
 
     /// The length of a term in characters: UTF-8 characters, not counting
-    /// the zero-width bytes.
+    /// the zero-width ones.
     pub fn term_len(&self, key: &[u8]) -> usize {
-        key.iter()
-            .filter(|&&b| b & 0xC0 != 0x80 && !self.contains(b))
-            .count()
+        if !self.has_multibyte() {
+            return key
+                .iter()
+                .filter(|&&b| b & 0xC0 != 0x80 && !self.contains_byte(b))
+                .count();
+        }
+        let mut count = 0;
+        let mut at = 0;
+        while at < key.len() {
+            let b = key[at];
+            if b.is_ascii() {
+                count += usize::from(!self.contains_byte(b));
+                at += 1;
+            } else if b & 0xC0 == 0x80 {
+                at += 1; // a stray continuation byte is not a character
+            } else {
+                let (zero, len) = self.multibyte_at(key, at);
+                count += usize::from(!zero);
+                at += len;
+            }
+        }
+        count
     }
 
-    /// The term without its zero-width bytes: terms that differ only in
-    /// zero-width bytes share this form (and therefore one expansion slot
-    /// under a cap, see `AutomatonWeight::set_max_expansions`).
+    /// The term without its zero-width characters: terms that differ only
+    /// in them share this form (and therefore one expansion slot under a
+    /// cap, see `AutomatonWeight::set_max_expansions`).
     pub fn strip<'a>(&self, key: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-        if self.is_empty() || !key.iter().any(|&b| self.contains(b)) {
-            std::borrow::Cow::Borrowed(key)
-        } else {
-            std::borrow::Cow::Owned(key.iter().copied().filter(|&b| !self.contains(b)).collect())
+        if self.is_empty() {
+            return std::borrow::Cow::Borrowed(key);
+        }
+        if !self.has_multibyte() {
+            if !key.iter().any(|&b| self.contains_byte(b)) {
+                return std::borrow::Cow::Borrowed(key);
+            }
+            return std::borrow::Cow::Owned(
+                key.iter()
+                    .copied()
+                    .filter(|&b| !self.contains_byte(b))
+                    .collect(),
+            );
+        }
+        let mut out: Option<Vec<u8>> = None;
+        let mut at = 0;
+        while at < key.len() {
+            let b = key[at];
+            let (zero, len) = if b.is_ascii() {
+                (self.contains_byte(b), 1)
+            } else if b & 0xC0 == 0x80 {
+                (false, 1)
+            } else {
+                self.multibyte_at(key, at)
+            };
+            match (&mut out, zero) {
+                (None, true) => out = Some(key[..at].to_vec()),
+                (Some(out), false) => out.extend_from_slice(&key[at..at + len]),
+                _ => {}
+            }
+            at += len;
+        }
+        match out {
+            Some(out) => std::borrow::Cow::Owned(out),
+            None => std::borrow::Cow::Borrowed(key),
         }
     }
 }
@@ -330,7 +454,7 @@ where
     fn new(
         dict: &'a fst_termdict::TermDictionary,
         automaton: &'a A,
-        zero_width: ZeroWidthBytes,
+        zero_width: ZeroWidthChars,
     ) -> Self {
         ShortestFirstTerms {
             dict,
@@ -363,7 +487,7 @@ where
 pub struct ShortestFirstTerms<'a, A: Automaton> {
     dict: &'a sstable_termdict::TermDictionary,
     automaton: &'a A,
-    zero_width: ZeroWidthBytes,
+    zero_width: ZeroWidthChars,
     levels: Option<std::vec::IntoIter<(usize, ShortestFirstLevel)>>,
 }
 
@@ -376,7 +500,7 @@ where
     fn new(
         dict: &'a sstable_termdict::TermDictionary,
         automaton: &'a A,
-        zero_width: ZeroWidthBytes,
+        zero_width: ZeroWidthChars,
     ) -> Self {
         ShortestFirstTerms {
             dict,

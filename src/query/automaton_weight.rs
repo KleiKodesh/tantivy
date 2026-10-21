@@ -11,7 +11,7 @@ use crate::index::SegmentReader;
 use crate::postings::TermInfo;
 use crate::query::{BitSetDocSet, ConstScorer, Explanation, Scorer, Weight};
 use crate::schema::{Field, IndexRecordOption};
-use crate::termdict::{TermDictionary, TermStreamer, WithoutKeys, ZeroWidthBytes};
+use crate::termdict::{TermDictionary, TermStreamer, WithoutKeys, ZeroWidthChars};
 use crate::{DocId, Score, TantivyError};
 
 /// Collects the terms an [`AutomatonWeight`] matched in the term dictionary
@@ -100,8 +100,8 @@ pub struct AutomatonWeight<A> {
     max_expansions: Option<usize>,
     // Primary sort key for capping; `None` ranks every term 0.
     expansion_rank: Option<ExpansionRank>,
-    // Bytes that do not count towards a term's length when capping.
-    zero_width: ZeroWidthBytes,
+    // Characters that do not count towards a term's length when capping.
+    zero_width: ZeroWidthChars,
 }
 
 impl<A> AutomatonWeight<A>
@@ -118,7 +118,7 @@ where
             matched_terms_sink: None,
             max_expansions: None,
             expansion_rank: None,
-            zero_width: ZeroWidthBytes::NONE,
+            zero_width: ZeroWidthChars::NONE,
         }
     }
 
@@ -135,7 +135,7 @@ where
             matched_terms_sink: None,
             max_expansions: None,
             expansion_rank: None,
-            zero_width: ZeroWidthBytes::NONE,
+            zero_width: ZeroWidthChars::NONE,
         }
     }
 
@@ -152,7 +152,7 @@ where
     ///
     /// Which terms are "best": the lowest [rank](Self::set_expansion_rank)
     /// first, then the shortest (in characters, see
-    /// [`set_zero_width_bytes`](Self::set_zero_width_bytes)), then the
+    /// [`set_zero_width_chars`](Self::set_zero_width_chars)), then the
     /// highest document count, then byte order.
     ///
     /// Without a rank (and outside JSON paths) the cap is applied INSIDE the
@@ -173,10 +173,11 @@ where
         self.expansion_rank = Some(rank);
     }
 
-    /// Bytes that do not count towards a term's length when the cap prefers
-    /// shorter terms, e.g. an intra-word apostrophe or quote the tokenizer
-    /// keeps. See [`ZeroWidthBytes`].
-    pub fn set_zero_width_bytes(&mut self, zero_width: ZeroWidthBytes) {
+    /// Characters that do not count towards a term's length when the cap
+    /// prefers shorter terms, e.g. an intra-word apostrophe, quote or
+    /// combining mark the tokenizer keeps. Under a cap, terms that differ only
+    /// in them are one slot. See [`ZeroWidthChars`].
+    pub fn set_zero_width_chars(&mut self, zero_width: ZeroWidthChars) {
         self.zero_width = zero_width;
     }
 
@@ -426,7 +427,7 @@ struct StrippedGroup {
 /// level's byte order of first appearance.
 fn group_by_stripped(
     level: Vec<(Vec<u8>, TermInfo)>,
-    zero_width: crate::termdict::ZeroWidthBytes,
+    zero_width: crate::termdict::ZeroWidthChars,
 ) -> Vec<StrippedGroup> {
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
     let mut groups: Vec<StrippedGroup> = Vec::new();
@@ -562,7 +563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_automaton_weight_max_expansions_zero_width_bytes() -> crate::Result<()> {
+    fn test_automaton_weight_max_expansions_zero_width_chars() -> crate::Result<()> {
         // "abc" (3 chars) and "a\"bc" (4 chars, 3 with a zero-width quote) both
         // match; cap 1 keeps the shorter. With the quote zero-width they are
         // the same form ("abc"), so they share the one slot and both are kept
@@ -585,7 +586,7 @@ mod tests {
         assert_eq!(scorer.advance(), TERMINATED);
         assert_eq!(sink.take_strings(), vec!["abc".to_string()]);
 
-        automaton_weight.set_zero_width_bytes(crate::termdict::ZeroWidthBytes::new(b"\""));
+        automaton_weight.set_zero_width_chars(crate::termdict::ZeroWidthChars::new(b"\""));
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
         assert_eq!(scorer.doc(), 0u32);
         assert_eq!(scorer.advance(), 1u32);
@@ -619,7 +620,7 @@ mod tests {
         let sink = super::MatchedTermsSink::new();
         automaton_weight.set_matched_terms_sink(sink.clone());
         automaton_weight.set_max_expansions(2);
-        automaton_weight.set_zero_width_bytes(crate::termdict::ZeroWidthBytes::new(b"\""));
+        automaton_weight.set_zero_width_chars(crate::termdict::ZeroWidthChars::new(b"\""));
         let _ = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
         let mut kept = sink.take_strings();
         kept.sort();
@@ -637,6 +638,47 @@ mod tests {
             kept,
             vec!["a\"bc".to_string(), "abc".to_string(), "abd".to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_multibyte_zero_width_variants_share_one_slot() -> crate::Result<()> {
+        // As above with a multi-byte zero-width character (a combining acute
+        // accent): "ab\u{301}c" is as short as "abc" and shares its slot.
+        static COMBINING: [(char, char); 1] = [('\u{300}', '\u{36F}')];
+        let mut schema = Schema::builder();
+        let title = schema.add_text_field("title", STRING);
+        let index = Index::create_in_ram(schema.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        for t in ["abc", "ab\u{301}c", "abd", "abd", "abe"] {
+            index_writer.add_document(doc!(title=>t))?;
+        }
+        index_writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        let mut automaton_weight = AutomatonWeight::new(title, PrefixedByA);
+        let sink = super::MatchedTermsSink::new();
+        automaton_weight.set_matched_terms_sink(sink.clone());
+        automaton_weight.set_max_expansions(2);
+        let expected = vec![
+            "abc".to_string(),
+            "abd".to_string(),
+            "ab\u{301}c".to_string(),
+        ];
+        automaton_weight
+            .set_zero_width_chars(crate::termdict::ZeroWidthChars::NONE.with_ranges(&COMBINING));
+        let _ = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        let mut kept = sink.take_strings();
+        kept.sort();
+        assert_eq!(kept, expected);
+
+        // the full-walk path (a rank is set) groups the same way
+        automaton_weight.set_expansion_rank(std::sync::Arc::new(|_key: &[u8]| 0));
+        let _ = automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+        let mut kept = sink.take_strings();
+        kept.sort();
+        assert_eq!(kept, expected);
         Ok(())
     }
 

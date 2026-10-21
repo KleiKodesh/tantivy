@@ -8,15 +8,16 @@
 //! `*כי*`) is then never visited: the walk cost is bounded by the cap, not
 //! by the expansion.
 //!
-//! Length counts UTF-8 characters. The caller may declare ASCII bytes as
-//! zero-width ([`ZeroWidthBytes`]): an intra-word mark the tokenizer keeps
-//! (an apostrophe, a quote) then does not push a term to a later level.
+//! Length counts UTF-8 characters. The caller may declare characters as
+//! zero-width ([`ZeroWidthChars`]): an intra-word mark the tokenizer keeps
+//! (an apostrophe, a quote, a combining accent or vowel point) then does not
+//! push a term to a later level.
 
 use tantivy_fst::raw::{CompiledAddr, Fst};
 use tantivy_fst::Automaton;
 
 use crate::directory::OwnedBytes;
-use crate::termdict::{TermOrdinal, ZeroWidthBytes};
+use crate::termdict::{TermOrdinal, ZeroWidthChars};
 
 struct Frontier<S> {
     addr: CompiledAddr,
@@ -33,7 +34,7 @@ pub type Level = Vec<(Vec<u8>, TermOrdinal)>;
 pub struct ShortestFirstWalk<'a, A: Automaton> {
     fst: &'a Fst<OwnedBytes>,
     automaton: &'a A,
-    zero_width: ZeroWidthBytes,
+    zero_width: ZeroWidthChars,
     frontier: Vec<Frontier<A::State>>,
     level: usize,
 }
@@ -46,7 +47,7 @@ where
     pub(crate) fn new(
         fst: &'a Fst<OwnedBytes>,
         automaton: &'a A,
-        zero_width: ZeroWidthBytes,
+        zero_width: ZeroWidthChars,
     ) -> Self {
         let start = automaton.start();
         let frontier = if automaton.can_match(&start) {
@@ -96,7 +97,7 @@ where
                 state,
                 key,
             };
-            if self.zero_width.contains(t.inp) {
+            if self.zero_width.contains_byte(t.inp) {
                 same.push(child);
                 continue;
             }
@@ -107,19 +108,27 @@ where
                 0xF0..=0xF7 => 3,
                 _ => 0, // stray continuation byte: treat as its own char
             };
-            self.complete_char(child, extra, next);
+            self.complete_char(child, extra, extra + 1, same, next);
         }
     }
 
-    /// Consumes `remaining` continuation bytes, then pushes into `next`.
+    /// Consumes `remaining` continuation bytes of a character of `len`
+    /// bytes, then pushes into `next`, or into `same` when the character is
+    /// zero-width.
     fn complete_char(
         &self,
         entry: Frontier<A::State>,
         remaining: usize,
+        len: usize,
+        same: &mut Vec<Frontier<A::State>>,
         next: &mut Vec<Frontier<A::State>>,
     ) {
         if remaining == 0 {
-            next.push(entry);
+            if len > 1 && self.zero_width.ends_with_zero_width(&entry.key, len) {
+                same.push(entry);
+            } else {
+                next.push(entry);
+            }
             return;
         }
         let node = self.fst.node(entry.addr);
@@ -141,6 +150,8 @@ where
                     key,
                 },
                 remaining - 1,
+                len,
+                same,
                 next,
             );
         }
