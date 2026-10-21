@@ -74,6 +74,30 @@ where
         self.level
     }
 
+    /// True when the walk has at least one more match: a depth-first search
+    /// from the frontier that stops at the first match. The walk itself is
+    /// not advanced.
+    pub fn has_more(&self) -> bool {
+        let mut stack: Vec<(CompiledAddr, A::State)> = self
+            .frontier
+            .iter()
+            .map(|f| (f.addr, f.state.clone()))
+            .collect();
+        while let Some((addr, state)) = stack.pop() {
+            let node = self.fst.node(addr);
+            if node.is_final() && self.automaton.is_match(&state) {
+                return true;
+            }
+            for t in node.transitions() {
+                let next = self.automaton.accept(&state, t.inp);
+                if self.automaton.can_match(&next) {
+                    stack.push((t.addr, next));
+                }
+            }
+        }
+        false
+    }
+
     /// Follows one whole UTF-8 character (lead + continuation bytes) from
     /// `entry`, pushing every reachable node after it into `next`. Zero-width
     /// transitions go to `same` (this level) instead.

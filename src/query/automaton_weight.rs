@@ -31,6 +31,8 @@ use crate::{DocId, Score, TantivyError};
 #[derive(Clone, Default)]
 pub struct MatchedTermsSink {
     matched: Arc<Mutex<BTreeSet<Vec<u8>>>>,
+    // Set when an expansion cap left out matching terms (see `is_truncated`).
+    truncated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MatchedTermsSink {
@@ -65,6 +67,20 @@ impl MatchedTermsSink {
     /// Returns true if no term has been collected.
     pub fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+
+    /// True when a capped expansion reporting into this sink left out at
+    /// least one matching term (in any segment). See
+    /// [`AutomatonWeight::set_max_expansions`]. Not reset by `take_*`.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Records that an expansion feeding this sink was truncated (for
+    /// callers that cap an expansion themselves and report it here).
+    pub fn mark_truncated(&self) {
+        self.truncated
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<Vec<u8>>> {
@@ -164,6 +180,13 @@ where
     /// The cap is per segment: an index with several segments may use up to
     /// `cap` terms in each. Merging the index into one segment makes the cap
     /// global.
+    ///
+    /// When the cap leaves out a matching term, an attached
+    /// [`MatchedTermsSink`] is marked truncated
+    /// ([`MatchedTermsSink::is_truncated`]). Nothing extra is walked unless
+    /// the cap is filled exactly at the end of a length level; then the walk
+    /// searches depth first for one more match (stopping at the first; when
+    /// none exists it may visit the rest of the matching subtree).
     pub fn set_max_expansions(&mut self, cap: usize) {
         self.max_expansions = Some(cap);
     }
@@ -187,10 +210,16 @@ where
 
     /// Level-by-level walk of `dict`; stops at `cap`. Ties on the last level
     /// go to the higher document count, then byte order.
-    fn cap_shortest_first(&self, dict: &TermDictionary, cap: usize) -> io::Result<Vec<Vec<u8>>> {
+    /// Also returns whether the cap left out a matching term.
+    fn cap_shortest_first(
+        &self,
+        dict: &TermDictionary,
+        cap: usize,
+    ) -> io::Result<(Vec<Vec<u8>>, bool)> {
         let automaton: &A = &self.automaton;
         let mut walk = dict.search_shortest_first(automaton, self.zero_width);
         let mut kept: Vec<Vec<u8>> = Vec::new();
+        let mut truncated = false;
         if self.zero_width.is_empty() {
             while kept.len() < cap {
                 let Some((_, level)) = walk.next_level()? else {
@@ -200,6 +229,7 @@ where
                 if level.len() <= room {
                     kept.extend(level.into_iter().map(|(key, _)| key));
                 } else {
+                    truncated = true;
                     let mut level_terms: Vec<(std::cmp::Reverse<u32>, Vec<u8>)> = level
                         .into_iter()
                         .map(|(key, info)| (std::cmp::Reverse(info.doc_freq), key))
@@ -208,7 +238,10 @@ where
                     kept.extend(level_terms.into_iter().take(room).map(|(_, key)| key));
                 }
             }
-            return Ok(kept);
+            if !truncated && kept.len() >= cap {
+                truncated = walk.has_more()?;
+            }
+            return Ok((kept, truncated));
         }
         // With zero-width bytes, terms that differ only in them (a word and
         // its forms with an intra-word quote) are ONE slot under the cap,
@@ -226,6 +259,7 @@ where
                 slots += groups.len();
                 kept.extend(groups.into_iter().flat_map(|g| g.terms));
             } else {
+                truncated = true;
                 let mut groups = groups;
                 groups.sort_unstable_by(|a, b| {
                     b.doc_freq
@@ -236,12 +270,16 @@ where
                 kept.extend(groups.into_iter().take(room).flat_map(|g| g.terms));
             }
         }
-        Ok(kept)
+        if !truncated && slots >= cap {
+            truncated = walk.has_more()?;
+        }
+        Ok((kept, truncated))
     }
 
     /// Full walk of `dict`, then sort by (rank, shortest, most frequent,
     /// bytes) and keep `cap`.
-    fn cap_full_walk(&self, dict: &TermDictionary, cap: usize) -> io::Result<Vec<Vec<u8>>> {
+    /// Also returns whether the cap left out a matching term.
+    fn cap_full_walk(&self, dict: &TermDictionary, cap: usize) -> io::Result<(Vec<Vec<u8>>, bool)> {
         let mut stream = self.automaton_stream_with_keys(dict)?;
         if self.zero_width.is_empty() {
             let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u32>, Vec<u8>)> = Vec::new();
@@ -252,8 +290,9 @@ where
                 ranked.push((rank, chars, std::cmp::Reverse(stream.value().doc_freq), key));
             }
             ranked.sort_unstable();
+            let truncated = ranked.len() > cap;
             ranked.truncate(cap);
-            return Ok(ranked.into_iter().map(|e| e.3).collect());
+            return Ok((ranked.into_iter().map(|e| e.3).collect(), truncated));
         }
         // One slot per zero-width-stripped form (see `cap_shortest_first`):
         // the slot's rank is its best member's, its doc count the sum.
@@ -278,19 +317,25 @@ where
             })
             .collect();
         slots.sort_unstable_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
+        let truncated = slots.len() > cap;
         slots.truncate(cap);
-        Ok(slots.into_iter().flat_map(|s| s.4).collect())
+        Ok((slots.into_iter().flat_map(|s| s.4).collect(), truncated))
     }
 
     /// Every term the automaton matches in `term_dict`, capped and reported
     /// to the sink as configured.
     fn matched_terms(&self, term_dict: &TermDictionary) -> io::Result<Vec<TermInfo>> {
         if let Some(cap) = self.max_expansions {
-            let kept = if self.uses_shortest_first_walk() {
+            let (kept, truncated) = if self.uses_shortest_first_walk() {
                 self.cap_shortest_first(term_dict, cap)?
             } else {
                 self.cap_full_walk(term_dict, cap)?
             };
+            if truncated {
+                if let Some(sink) = &self.matched_terms_sink {
+                    sink.mark_truncated();
+                }
+            }
             let mut infos = Vec::with_capacity(kept.len());
             let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
             for key in kept {
@@ -559,6 +604,25 @@ mod tests {
         assert_eq!(scorer.doc(), 0u32); // "abc"
         assert_eq!(scorer.advance(), TERMINATED); // "abcd" (doc 2) dropped
         assert_eq!(sink.take_strings(), vec!["abc".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_max_expansions_reports_truncation() -> crate::Result<()> {
+        // "abc" and "abcd" match: cap 1 truncates, cap 2 (filled exactly) and
+        // cap 3 do not
+        let index = create_index()?;
+        let field = index.schema().get_field("title").unwrap();
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        for (cap, truncated) in [(1, true), (2, false), (3, false)] {
+            let mut automaton_weight = AutomatonWeight::new(field, PrefixedByA);
+            let sink = super::MatchedTermsSink::new();
+            automaton_weight.set_matched_terms_sink(sink.clone());
+            automaton_weight.set_max_expansions(cap);
+            automaton_weight.scorer(searcher.segment_reader(0u32), 1.0)?;
+            assert_eq!(sink.is_truncated(), truncated, "cap {cap}");
+        }
         Ok(())
     }
 

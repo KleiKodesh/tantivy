@@ -476,6 +476,12 @@ where
             .collect();
         Ok(Some((length, terms)))
     }
+
+    /// True when a later [`next_level`](Self::next_level) call would return
+    /// a level: searches depth first for one more match (stops at the first).
+    pub fn has_more(&mut self) -> io::Result<bool> {
+        Ok(self.walk.has_more())
+    }
 }
 
 /// Shortest-first walk over a [`TermDictionary`]: see
@@ -528,5 +534,24 @@ where
             self.levels = Some(by_len.into_iter().collect::<Vec<_>>().into_iter());
         }
         Ok(self.levels.as_mut().unwrap().next())
+    }
+
+    /// True when a later [`next_level`](Self::next_level) call would return
+    /// a level.
+    pub fn has_more(&mut self) -> io::Result<bool> {
+        if self.levels.is_none() {
+            let Some(first) = self.next_level()? else {
+                return Ok(false);
+            };
+            let rest: Vec<_> = self.levels.take().unwrap().collect();
+            self.levels = Some(
+                std::iter::once(first)
+                    .chain(rest)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            return Ok(true);
+        }
+        Ok(self.levels.as_ref().unwrap().len() > 0)
     }
 }
