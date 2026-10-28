@@ -374,9 +374,9 @@ impl SpanScorer {
         let lo = if self.ordered {
             prev + 1
         } else {
-            prev.saturating_sub(gap + 1)
+            prev.saturating_sub(gap.saturating_add(1))
         };
-        let hi = prev.saturating_add(gap + 1);
+        let hi = prev.saturating_add(gap.saturating_add(1));
         let mut idx = self.positions[slot].partition_point(|&q| q < lo);
         while idx < self.positions[slot].len() {
             let q = self.positions[slot][idx];
@@ -654,6 +654,21 @@ mod tests {
         let mut q = q;
         q.set_ordered(false);
         assert_eq!(search(&index, &q)?, vec![0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn max_gap_does_not_overflow() -> crate::Result<()> {
+        let (index, f) = build(&["b x a", "a x x b", "a c"])?;
+        for ordered in [true, false] {
+            let hits = |gap: u32| -> crate::Result<Vec<u32>> {
+                let mut q = SpanQuery::new(f, exact(f, "a")).then_within(gap, exact(f, "b"));
+                q.set_ordered(ordered);
+                search(&index, &q)
+            };
+            assert_eq!(hits(u32::MAX)?, hits(u32::MAX - 1)?);
+            assert!(!hits(u32::MAX)?.is_empty());
+        }
         Ok(())
     }
 
