@@ -60,6 +60,12 @@ pub struct IndexWriterOptions {
     #[builder(default = 4)]
     /// Defines the number of merger threads to use.
     num_merge_threads: usize,
+    #[builder(default = false)]
+    /// Runs the indexing worker and merge threads at a below-normal OS
+    /// scheduling priority, so that a background indexing job leaves the
+    /// machine responsive. Best effort: applied on Windows, Linux and Apple
+    /// platforms, ignored elsewhere or if the OS refuses it.
+    low_priority_threads: bool,
 }
 
 /// `IndexWriter` is the user entry-point to add document to an index.
@@ -315,6 +321,7 @@ impl<D: Document> IndexWriter<D> {
             stamper.clone(),
             &delete_queue.cursor(),
             options.num_merge_threads,
+            options.low_priority_threads,
         )?;
 
         let mut index_writer = Self {
@@ -422,9 +429,13 @@ impl<D: Document> IndexWriter<D> {
 
         let mem_budget = self.options.memory_budget_per_thread;
         let index = self.index.clone();
+        let low_priority = self.options.low_priority_threads;
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
             .spawn(move || {
+                if low_priority {
+                    crate::indexer::thread_priority::lower_current_thread_priority();
+                }
                 loop {
                     let mut document_iterator = document_receiver_clone
                         .clone()

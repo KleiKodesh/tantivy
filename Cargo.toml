@@ -98,7 +98,10 @@ unwrap-infallible = "1.0.0"
 serde-tuple-vec-map = "1.0.1"
 
 [target.'cfg(windows)'.dependencies]
-winapi = "0.3.9"
+winapi = { version = "0.3.9", features = ["processthreadsapi", "winbase"] }
+
+[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 binggan = "0.17.0"

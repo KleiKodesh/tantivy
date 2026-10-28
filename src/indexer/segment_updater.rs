@@ -297,6 +297,7 @@ impl SegmentUpdater {
         stamper: Stamper,
         delete_cursor: &DeleteCursor,
         num_merge_threads: usize,
+        low_priority_threads: bool,
     ) -> crate::Result<SegmentUpdater> {
         let segments = index.searchable_segment_metas()?;
         let segment_manager = SegmentManager::from_segments(segments, delete_cursor);
@@ -312,6 +313,11 @@ impl SegmentUpdater {
         let merge_thread_pool = ThreadPoolBuilder::new()
             .thread_name(|i| format!("merge_thread_{i}"))
             .num_threads(num_merge_threads)
+            .start_handler(move |_| {
+                if low_priority_threads {
+                    super::thread_priority::lower_current_thread_priority();
+                }
+            })
             .panic_handler(move |panic| {
                 // We don't print the panic content itself,
                 // it is already printed during the unwinding
