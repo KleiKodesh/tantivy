@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use common::BitSet;
 use tantivy_fst::Automaton;
@@ -118,6 +118,18 @@ pub struct AutomatonWeight<A> {
     expansion_rank: Option<ExpansionRank>,
     // Characters that do not count towards a term's length when capping.
     zero_width: ZeroWidthChars,
+    // Terms that always keep a slot under the cap (when they match).
+    pinned_terms: Vec<Vec<u8>>,
+    // When set, the cap is one cap over all these segments.
+    cap_segments: Option<Vec<SegmentReader>>,
+    // The expansion over `cap_segments`, computed by the first scorer.
+    global_terms: OnceLock<Result<GlobalTerms, String>>,
+}
+
+/// The capped expansion over several segments.
+struct GlobalTerms {
+    terms: Vec<Vec<u8>>,
+    truncated: bool,
 }
 
 impl<A> AutomatonWeight<A>
@@ -135,6 +147,9 @@ where
             max_expansions: None,
             expansion_rank: None,
             zero_width: ZeroWidthChars::NONE,
+            pinned_terms: Vec::new(),
+            cap_segments: None,
+            global_terms: OnceLock::new(),
         }
     }
 
@@ -152,6 +167,9 @@ where
             max_expansions: None,
             expansion_rank: None,
             zero_width: ZeroWidthChars::NONE,
+            pinned_terms: Vec::new(),
+            cap_segments: None,
+            global_terms: OnceLock::new(),
         }
     }
 
@@ -178,8 +196,9 @@ where
     /// walked and sorted, since the rank is not known before a term is seen.
     ///
     /// The cap is per segment: an index with several segments may use up to
-    /// `cap` terms in each. Merging the index into one segment makes the cap
-    /// global.
+    /// `cap` terms in each, unless
+    /// [`set_cap_across_segments`](Self::set_cap_across_segments) makes it
+    /// one cap over all segments.
     ///
     /// When the cap leaves out a matching term, an attached
     /// [`MatchedTermsSink`] is marked truncated
@@ -189,6 +208,24 @@ where
     /// none exists it may visit the rest of the matching subtree).
     pub fn set_max_expansions(&mut self, cap: usize) {
         self.max_expansions = Some(cap);
+    }
+
+    /// Makes the cap one cap over all of `segments` (normally
+    /// [`Searcher::segment_readers`](crate::Searcher::segment_readers)): the
+    /// segments are walked together, shortest level first, and a term's
+    /// document count is summed over them, so the kept terms do not depend on
+    /// how the index is split into segments. Computed once, by the first
+    /// scorer. With one segment this is the per-segment cap and costs nothing.
+    pub fn set_cap_across_segments(&mut self, segments: &[SegmentReader]) {
+        self.cap_segments = (segments.len() > 1).then(|| segments.to_vec());
+    }
+
+    /// Terms that always keep a slot under the cap when the automaton matches
+    /// them and the dictionary has them (e.g. the exact word typed), even when
+    /// they would not rank among the best `cap`; the worst kept slot makes
+    /// room.
+    pub fn set_pinned_terms(&mut self, terms: Vec<Vec<u8>>) {
+        self.pinned_terms = terms;
     }
 
     /// The primary key the cap sorts by (e.g. a fuzzy match's edit distance).
@@ -208,128 +245,209 @@ where
         self.expansion_rank.is_none() && self.json_path_bytes.is_none()
     }
 
-    /// Level-by-level walk of `dict`; stops at `cap`. Ties on the last level
-    /// go to the higher document count, then byte order.
-    /// Also returns whether the cap left out a matching term.
+    /// Level-by-level walk of the dictionaries in lockstep (shortest level of
+    /// any dictionary first); stops at `cap` slots. A slot is one
+    /// zero-width-stripped form; its document count is summed over its terms
+    /// and dictionaries. Ties on the last level go to the higher document
+    /// count, then byte order. Also returns whether the cap left out a
+    /// matching term.
     fn cap_shortest_first(
         &self,
-        dict: &TermDictionary,
+        dicts: &[&TermDictionary],
         cap: usize,
-    ) -> io::Result<(Vec<Vec<u8>>, bool)> {
+        check_more: bool,
+    ) -> io::Result<(Vec<StrippedGroup>, bool)> {
         let automaton: &A = &self.automaton;
-        let mut walk = dict.search_shortest_first(automaton, self.zero_width);
-        let mut kept: Vec<Vec<u8>> = Vec::new();
-        let mut truncated = false;
-        if self.zero_width.is_empty() {
-            while kept.len() < cap {
-                let Some((_, level)) = walk.next_level()? else {
-                    break;
-                };
-                let room = cap - kept.len();
-                if level.len() <= room {
-                    kept.extend(level.into_iter().map(|(key, _)| key));
-                } else {
-                    truncated = true;
-                    let mut level_terms: Vec<(std::cmp::Reverse<u32>, Vec<u8>)> = level
-                        .into_iter()
-                        .map(|(key, info)| (std::cmp::Reverse(info.doc_freq), key))
-                        .collect();
-                    level_terms.sort_unstable();
-                    kept.extend(level_terms.into_iter().take(room).map(|(_, key)| key));
-                }
-            }
-            if !truncated && kept.len() >= cap && self.matched_terms_sink.is_some() {
-                truncated = walk.has_more()?;
-            }
-            return Ok((kept, truncated));
+        let mut walks: Vec<_> = dicts
+            .iter()
+            .map(|dict| dict.search_shortest_first(automaton, self.zero_width))
+            .collect();
+        let mut pending = Vec::with_capacity(walks.len());
+        for walk in walks.iter_mut() {
+            pending.push(walk.next_level()?);
         }
-        // With zero-width bytes, terms that differ only in them (a word and
-        // its forms with an intra-word quote) are ONE slot under the cap,
-        // ranked by their summed doc count; all of a kept slot's terms are
-        // used. They always share a level: zero-width bytes do not count
-        // towards the length the walk orders by.
-        let mut slots = 0usize;
-        while slots < cap {
-            let Some((_, level)) = walk.next_level()? else {
+        let mut kept: Vec<StrippedGroup> = Vec::new();
+        let mut truncated = false;
+        while kept.len() < cap {
+            let Some(length) = pending.iter().flatten().map(|(len, _)| *len).min() else {
                 break;
             };
-            let groups = group_by_stripped(level, self.zero_width);
-            let room = cap - slots;
-            if groups.len() <= room {
-                slots += groups.len();
-                kept.extend(groups.into_iter().flat_map(|g| g.terms));
-            } else {
+            let mut level = Vec::new();
+            for (slot, walk) in pending.iter_mut().zip(walks.iter_mut()) {
+                if slot.as_ref().is_some_and(|(len, _)| *len == length) {
+                    let (_, terms) = slot.take().expect("checked above");
+                    level.extend(terms);
+                    *slot = walk.next_level()?;
+                }
+            }
+            let mut groups = group_by_stripped(level, self.zero_width);
+            let room = cap - kept.len();
+            if groups.len() > room {
                 truncated = true;
-                let mut groups = groups;
                 groups.sort_unstable_by(|a, b| {
                     b.doc_freq
                         .cmp(&a.doc_freq)
                         .then_with(|| a.stripped.cmp(&b.stripped))
                 });
-                slots += room;
-                kept.extend(groups.into_iter().take(room).flat_map(|g| g.terms));
+                groups.truncate(room);
             }
+            kept.extend(groups);
         }
-        if !truncated && slots >= cap && self.matched_terms_sink.is_some() {
-            truncated = walk.has_more()?;
+        if !truncated && kept.len() >= cap && check_more {
+            truncated = pending.iter().any(Option::is_some);
+            for walk in walks.iter_mut() {
+                truncated = truncated || walk.has_more()?;
+            }
         }
         Ok((kept, truncated))
     }
 
-    /// Full walk of `dict`, then sort by (rank, shortest, most frequent,
-    /// bytes) and keep `cap`.
-    /// Also returns whether the cap left out a matching term.
-    fn cap_full_walk(&self, dict: &TermDictionary, cap: usize) -> io::Result<(Vec<Vec<u8>>, bool)> {
-        let mut stream = self.automaton_stream_with_keys(dict)?;
-        if self.zero_width.is_empty() {
-            let mut ranked: Vec<(u32, usize, std::cmp::Reverse<u32>, Vec<u8>)> = Vec::new();
-            while stream.advance() {
-                let key = stream.key().to_vec();
-                let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
-                let chars = self.zero_width.term_len(&key);
-                ranked.push((rank, chars, std::cmp::Reverse(stream.value().doc_freq), key));
-            }
-            ranked.sort_unstable();
-            let truncated = ranked.len() > cap;
-            ranked.truncate(cap);
-            return Ok((ranked.into_iter().map(|e| e.3).collect(), truncated));
-        }
-        // One slot per zero-width-stripped form (see `cap_shortest_first`):
-        // the slot's rank is its best member's, its doc count the sum.
-        let mut by_form: std::collections::HashMap<Vec<u8>, (u32, usize, u64, Vec<Vec<u8>>)> =
+    /// Full walk of the dictionaries, then sort the slots (one per
+    /// zero-width-stripped form) by (rank, shortest, most frequent, bytes)
+    /// and keep `cap`. A slot's rank is its best member's, its document count
+    /// the sum over its terms and dictionaries. Also returns whether the cap
+    /// left out a matching term.
+    fn cap_full_walk(
+        &self,
+        dicts: &[&TermDictionary],
+        cap: usize,
+    ) -> io::Result<(Vec<StrippedGroup>, bool)> {
+        let mut by_form: std::collections::HashMap<Vec<u8>, (u32, usize, StrippedGroup)> =
             std::collections::HashMap::new();
-        while stream.advance() {
-            let key = stream.key().to_vec();
-            let rank = self.expansion_rank.as_ref().map(|r| r(&key)).unwrap_or(0);
-            let chars = self.zero_width.term_len(&key);
-            let form = self.zero_width.strip(&key).into_owned();
-            let slot = by_form
-                .entry(form)
-                .or_insert((u32::MAX, chars, 0, Vec::new()));
-            slot.0 = slot.0.min(rank);
-            slot.2 += u64::from(stream.value().doc_freq);
-            slot.3.push(key);
+        for dict in dicts {
+            let mut stream = self.automaton_stream_with_keys(dict)?;
+            while stream.advance() {
+                let key = stream.key();
+                let rank = self.expansion_rank.as_ref().map(|r| r(key)).unwrap_or(0);
+                let chars = self.zero_width.term_len(key);
+                let form = self.zero_width.strip(key).into_owned();
+                let slot = by_form.entry(form.clone()).or_insert((
+                    u32::MAX,
+                    chars,
+                    StrippedGroup {
+                        stripped: form,
+                        doc_freq: 0,
+                        terms: Vec::new(),
+                    },
+                ));
+                slot.0 = slot.0.min(rank);
+                slot.2.doc_freq += u64::from(stream.value().doc_freq);
+                if !slot.2.terms.iter().any(|t| t.as_slice() == key) {
+                    slot.2.terms.push(key.to_vec());
+                }
+            }
         }
-        let mut slots: Vec<(u32, usize, std::cmp::Reverse<u64>, Vec<u8>, Vec<Vec<u8>>)> = by_form
-            .into_iter()
-            .map(|(form, (rank, chars, df, terms))| {
-                (rank, chars, std::cmp::Reverse(df), form, terms)
-            })
-            .collect();
-        slots.sort_unstable_by(|a, b| (a.0, a.1, a.2, &a.3).cmp(&(b.0, b.1, b.2, &b.3)));
+        let mut slots: Vec<(u32, usize, StrippedGroup)> = by_form.into_values().collect();
+        slots.sort_unstable_by(|a, b| {
+            (a.0, a.1, std::cmp::Reverse(a.2.doc_freq), &a.2.stripped).cmp(&(
+                b.0,
+                b.1,
+                std::cmp::Reverse(b.2.doc_freq),
+                &b.2.stripped,
+            ))
+        });
         let truncated = slots.len() > cap;
         slots.truncate(cap);
-        Ok((slots.into_iter().flat_map(|s| s.4).collect(), truncated))
+        Ok((slots.into_iter().map(|s| s.2).collect(), truncated))
+    }
+
+    /// The kept terms of a capped expansion over `dicts` (several = one cap
+    /// for all of them), pinned terms included, and whether the cap left out
+    /// a matching term.
+    fn capped_terms(
+        &self,
+        dicts: &[&TermDictionary],
+        cap: usize,
+    ) -> io::Result<(Vec<Vec<u8>>, bool)> {
+        let (mut slots, mut truncated) = if self.uses_shortest_first_walk() {
+            let check_more = self.matched_terms_sink.is_some() || dicts.len() > 1;
+            self.cap_shortest_first(dicts, cap, check_more)?
+        } else {
+            self.cap_full_walk(dicts, cap)?
+        };
+        // Pinned terms always keep a slot (taken from the worst kept slot).
+        for pin in &self.pinned_terms {
+            let form = self.zero_width.strip(pin);
+            if slots.iter().any(|s| s.stripped.as_slice() == &*form) || !self.accepts(pin) {
+                continue;
+            }
+            let mut present = false;
+            for dict in dicts {
+                present = present || dict.get(pin)?.is_some();
+            }
+            if !present {
+                continue;
+            }
+            if cap == 0 {
+                break;
+            }
+            if slots.len() >= cap {
+                slots.truncate(cap - 1);
+                truncated = true;
+            }
+            slots.insert(
+                0,
+                StrippedGroup {
+                    stripped: form.into_owned(),
+                    doc_freq: 0,
+                    terms: vec![pin.clone()],
+                },
+            );
+        }
+        Ok((slots.into_iter().flat_map(|s| s.terms).collect(), truncated))
+    }
+
+    /// Whether the automaton matches `term`.
+    fn accepts(&self, term: &[u8]) -> bool {
+        let automaton: &A = &self.automaton;
+        let mut state = automaton.start();
+        for &byte in term {
+            if !automaton.can_match(&state) {
+                return false;
+            }
+            state = automaton.accept(&state, byte);
+        }
+        automaton.is_match(&state)
+    }
+
+    /// The capped expansion over every segment set by
+    /// [`set_cap_across_segments`](Self::set_cap_across_segments), computed
+    /// once.
+    fn global_terms(&self, segments: &[SegmentReader], cap: usize) -> io::Result<&GlobalTerms> {
+        let computed = self.global_terms.get_or_init(|| {
+            let mut indexes = Vec::with_capacity(segments.len());
+            for reader in segments {
+                indexes.push(
+                    reader
+                        .inverted_index(self.field)
+                        .map_err(|err| err.to_string())?,
+                );
+            }
+            let dicts: Vec<&TermDictionary> = indexes.iter().map(|i| i.terms()).collect();
+            let (terms, truncated) = self
+                .capped_terms(&dicts, cap)
+                .map_err(|err| err.to_string())?;
+            Ok(GlobalTerms { terms, truncated })
+        });
+        computed
+            .as_ref()
+            .map_err(|err| io::Error::other(err.clone()))
     }
 
     /// Every term the automaton matches in `term_dict`, capped and reported
     /// to the sink as configured.
     fn matched_terms(&self, term_dict: &TermDictionary) -> io::Result<Vec<TermInfo>> {
         if let Some(cap) = self.max_expansions {
-            let (kept, truncated) = if self.uses_shortest_first_walk() {
-                self.cap_shortest_first(term_dict, cap)?
-            } else {
-                self.cap_full_walk(term_dict, cap)?
+            let local;
+            let (kept, truncated): (&[Vec<u8>], bool) = match &self.cap_segments {
+                Some(segments) => {
+                    let global = self.global_terms(segments, cap)?;
+                    (&global.terms, global.truncated)
+                }
+                None => {
+                    local = self.capped_terms(&[term_dict], cap)?;
+                    (&local.0, local.1)
+                }
             };
             if truncated {
                 if let Some(sink) = &self.matched_terms_sink {
@@ -339,10 +457,10 @@ where
             let mut infos = Vec::with_capacity(kept.len());
             let mut sink = self.matched_terms_sink.as_ref().map(|s| s.lock());
             for key in kept {
-                if let Some(info) = term_dict.get(&key)? {
+                if let Some(info) = term_dict.get(key)? {
                     infos.push(info);
                     if let Some(sink) = sink.as_mut() {
-                        sink.insert(key);
+                        sink.insert(key.clone());
                     }
                 }
             }
@@ -487,7 +605,10 @@ fn group_by_stripped(
             groups.len() - 1
         });
         groups[at].doc_freq += u64::from(info.doc_freq);
-        groups[at].terms.push(key);
+        // The same term from several segments is one term.
+        if !groups[at].terms.contains(&key) {
+            groups[at].terms.push(key);
+        }
     }
     groups
 }
@@ -781,6 +902,94 @@ mod tests {
         let mut scorer = automaton_weight.scorer(searcher.segment_reader(0u32), 1.32)?;
         assert_eq!(scorer.doc(), 0u32);
         assert_eq!(scorer.score(), 1.32);
+        Ok(())
+    }
+
+    /// Terms the capped walk keeps on `index`, with one cap over all its
+    /// segments, and whether it reports truncation.
+    fn kept_across_segments(index: &Index, cap: usize, pins: &[&str]) -> (Vec<String>, bool) {
+        let field = index.schema().get_field("title").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let mut weight = AutomatonWeight::new(field, PrefixedByA);
+        let sink = super::MatchedTermsSink::new();
+        weight.set_matched_terms_sink(sink.clone());
+        weight.set_max_expansions(cap);
+        weight.set_pinned_terms(pins.iter().map(|p| p.as_bytes().to_vec()).collect());
+        weight.set_cap_across_segments(searcher.segment_readers());
+        for reader in searcher.segment_readers() {
+            weight.scorer(reader, 1.0).unwrap();
+        }
+        (sink.take_strings(), sink.is_truncated())
+    }
+
+    fn index_in_segments(segments: &[&[&str]]) -> crate::Result<Index> {
+        let mut schema = Schema::builder();
+        let title = schema.add_text_field("title", STRING);
+        let index = Index::create_in_ram(schema.build());
+        let mut index_writer: IndexWriter = index.writer_for_tests()?;
+        index_writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+        for docs in segments {
+            for doc in *docs {
+                index_writer.add_document(doc!(title=>*doc))?;
+            }
+            index_writer.commit()?;
+        }
+        Ok(index)
+    }
+
+    #[test]
+    fn test_automaton_weight_cap_across_segments_ignores_layout() -> crate::Result<()> {
+        // "ab" and "ax" tie on length; "ax" is more frequent once the segments
+        // are summed, though "ab" wins in the first segment alone.
+        let docs: [&str; 7] = ["ab", "ab", "ax", "abc", "ax", "ax", "abcd"];
+        let one = index_in_segments(&[&docs])?;
+        let three = index_in_segments(&[&docs[..3], &docs[3..5], &docs[5..]])?;
+        assert_eq!(three.searchable_segment_ids()?.len(), 3);
+        for cap in [1, 2, 3, 4] {
+            let expected = kept_across_segments(&one, cap, &[]);
+            assert_eq!(
+                kept_across_segments(&three, cap, &[]),
+                expected,
+                "cap {cap}"
+            );
+        }
+        assert_eq!(
+            kept_across_segments(&three, 1, &[]),
+            (vec!["ax".to_string()], true)
+        );
+        assert_eq!(kept_across_segments(&three, 4, &[]).1, false);
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_pinned_term_keeps_a_slot() -> crate::Result<()> {
+        let docs: [&str; 4] = ["ab", "ax", "abcd", "bcd"];
+        let index = index_in_segments(&[&docs[..2], &docs[2..]])?;
+        // Cap 2 keeps "ab" and "ax"; the pinned "abcd" takes the worst slot.
+        let (kept, truncated) = kept_across_segments(&index, 2, &["abcd"]);
+        assert_eq!(kept, vec!["ab".to_string(), "abcd".to_string()]);
+        assert!(truncated);
+        // A pin the automaton does not match, or the index lacks, is ignored.
+        let (kept, _) = kept_across_segments(&index, 2, &["bcd", "azz"]);
+        assert_eq!(kept, vec!["ab".to_string(), "ax".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_automaton_weight_cap_across_segments_term_once_per_segment() -> crate::Result<()> {
+        // "ab" in both segments: each segment reads its postings once.
+        let index = index_in_segments(&[&["ab", "abc"], &["ab"]])?;
+        let field = index.schema().get_field("title").unwrap();
+        let searcher = index.reader()?.searcher();
+        let mut weight = AutomatonWeight::new(field, PrefixedByA);
+        weight.set_max_expansions(5);
+        weight.set_cap_across_segments(searcher.segment_readers());
+        let counts: Vec<usize> = searcher
+            .segment_readers()
+            .iter()
+            .map(|r| weight.get_match_term_infos(r).unwrap().len())
+            .collect();
+        assert_eq!(counts, vec![2, 1]);
         Ok(())
     }
 }
