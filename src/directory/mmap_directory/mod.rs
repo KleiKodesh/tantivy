@@ -373,8 +373,53 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
     tempfile.write_all(content)?;
     tempfile.flush()?;
     tempfile.as_file_mut().sync_data()?;
-    tempfile.into_temp_path().persist(path)?;
+    let temp_path = tempfile.into_temp_path();
+    // On failure `temp_path` is dropped, which removes the temporary file.
+    replace_file(&temp_path, path)?;
+    // The file was moved: there is nothing left to delete.
+    let _ = temp_path.keep();
     Ok(())
+}
+
+/// Moves `from` over `to`, replacing it.
+///
+/// `std::fs::rename` uses POSIX rename semantics on Windows when the file system supports
+/// them, so the target can be replaced while another process holds it open with
+/// `FILE_SHARE_DELETE`. A reader that opened the target without that share mode (or an
+/// antivirus scan) makes the rename fail with `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_SHARING_VIOLATION` (32) for a short while: on Windows these are retried with growing
+/// delays for about 500 ms before a clear error is returned. The source is left in place on
+/// failure.
+fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const DELAYS_MS: [u64; 7] = [5, 10, 20, 40, 75, 150, 200];
+        let mut attempt = 0;
+        loop {
+            match fs::rename(from, to) {
+                Ok(()) => return Ok(()),
+                Err(err) if matches!(err.raw_os_error(), Some(5) | Some(32)) => {
+                    if attempt == DELAYS_MS.len() {
+                        return Err(io::Error::new(
+                            err.kind(),
+                            format!(
+                                "could not replace {to:?}: the file is held open by another process \
+                                 (still failing after {} retries over about 500 ms): {err}",
+                                DELAYS_MS.len()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(DELAYS_MS[attempt]));
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
+    }
 }
 
 impl Directory for MmapDirectory {
@@ -705,3 +750,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_replace_tests;
