@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
@@ -61,11 +62,45 @@ pub struct IndexWriterOptions {
     /// Defines the number of merger threads to use.
     num_merge_threads: usize,
     #[builder(default = false)]
-    /// Runs the indexing worker and merge threads at a below-normal OS
-    /// scheduling priority, so that a background indexing job leaves the
-    /// machine responsive. Best effort: applied on Windows, Linux and Apple
-    /// platforms, ignored elsewhere or if the OS refuses it.
+    /// Runs the indexing worker threads, and the merges the merge policy
+    /// starts on its own, in the OS background mode (see
+    /// [`BackgroundPriority`](crate::indexer::BackgroundPriority)): they get
+    /// CPU, and where the OS supports it disk and memory, only when nobody
+    /// else asks for them. A worker flushing its segment for a commit, and a
+    /// merge requested with [`IndexWriter::merge`], run at normal priority,
+    /// since a caller waits for them. Best effort: ignored where the OS has
+    /// no such mode or refuses it.
     low_priority_threads: bool,
+}
+
+/// A live handle on an [`IndexWriter`]'s memory budget per indexing thread
+/// (see [`IndexWriter::memory_budget`]).
+///
+/// Each worker reads the budget once per added batch: lowering it makes every
+/// worker whose buffer is above the new budget flush its segment to disk at
+/// its next batch (freeing the buffer; the segment becomes searchable at the
+/// next commit, as any flushed segment), and raising it lets the next
+/// segments grow larger. Cloning shares the budget.
+#[derive(Clone, Debug)]
+pub struct MemoryBudget(Arc<AtomicUsize>);
+
+impl MemoryBudget {
+    fn new(per_thread: usize) -> MemoryBudget {
+        MemoryBudget(Arc::new(AtomicUsize::new(per_thread)))
+    }
+
+    /// The current budget per indexing thread, in bytes.
+    pub fn per_thread(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Sets the budget per indexing thread, clamped to the range the writer
+    /// accepts at creation (at least 15 MB); returns the value set.
+    pub fn set_per_thread(&self, bytes: usize) -> usize {
+        let bytes = bytes.clamp(MEMORY_BUDGET_NUM_BYTES_MIN, MEMORY_BUDGET_NUM_BYTES_MAX - 1);
+        self.0.store(bytes, Ordering::Relaxed);
+        bytes
+    }
 }
 
 /// `IndexWriter` is the user entry-point to add document to an index.
@@ -82,6 +117,7 @@ pub struct IndexWriter<D: Document = TantivyDocument> {
     index: Index,
 
     options: IndexWriterOptions,
+    memory_budget: MemoryBudget,
 
     workers_join_handle: Vec<JoinHandle<crate::Result<()>>>,
 
@@ -186,26 +222,33 @@ pub fn advance_deletes(
 }
 
 fn index_documents<D: Document>(
-    memory_budget: usize,
+    memory_budget: &MemoryBudget,
     segment: Segment,
     grouped_document_iterator: &mut dyn Iterator<Item = AddBatch<D>>,
     segment_updater: &SegmentUpdater,
     mut delete_cursor: DeleteCursor,
 ) -> crate::Result<()> {
-    let mut segment_writer = SegmentWriter::for_segment(memory_budget, segment.clone())?;
+    let mut segment_writer =
+        SegmentWriter::for_segment(memory_budget.per_thread(), segment.clone())?;
+    let mut flush_for_memory = false;
     for document_group in grouped_document_iterator {
         for doc in document_group {
             segment_writer.add_document(doc)?;
         }
         let mem_usage = segment_writer.mem_usage();
-        if mem_usage >= memory_budget - MARGIN_IN_BYTES {
+        // read live: a lowered budget flushes the segment at this batch
+        if mem_usage >= memory_budget.per_thread() - MARGIN_IN_BYTES {
             debug!(
                 "Buffer limit reached, flushing segment with maxdoc={}.",
                 segment_writer.max_doc()
             );
+            flush_for_memory = true;
             break;
         }
     }
+    // The queue ended: a commit (or the writer's drop) waits for this flush,
+    // so it runs at normal priority even on a background worker.
+    let _normal = (!flush_for_memory).then(super::NormalPrioritySection::enter);
 
     if !segment_updater.is_alive() {
         return Ok(());
@@ -288,6 +331,16 @@ impl<D: Document> IndexWriter<D> {
         options: IndexWriterOptions,
         directory_lock: DirectoryLock,
     ) -> crate::Result<Self> {
+        let memory_budget = MemoryBudget::new(options.memory_budget_per_thread);
+        Self::with_memory_budget(index, options, directory_lock, memory_budget)
+    }
+
+    fn with_memory_budget(
+        index: Index,
+        options: IndexWriterOptions,
+        directory_lock: DirectoryLock,
+        memory_budget: MemoryBudget,
+    ) -> crate::Result<Self> {
         index.validate_plugins()?;
         if options.memory_budget_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             let err_msg = format!(
@@ -328,6 +381,7 @@ impl<D: Document> IndexWriter<D> {
             _directory_lock: Some(directory_lock),
 
             options: options.clone(),
+            memory_budget,
             index: index.clone(),
             index_writer_status: IndexWriterStatus::from(document_receiver),
             operation_sender: document_sender,
@@ -355,6 +409,14 @@ impl<D: Document> IndexWriter<D> {
     /// Accessor to the index.
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// A live handle on the memory budget per indexing thread, initially
+    /// `IndexWriterOptions::memory_budget_per_thread`. Changing it takes
+    /// effect at each worker's next batch (see [`MemoryBudget`]); it is kept
+    /// across [`IndexWriter::rollback`].
+    pub fn memory_budget(&self) -> MemoryBudget {
+        self.memory_budget.clone()
     }
 
     /// If there are some merging threads, blocks until they all finish their work and
@@ -427,15 +489,13 @@ impl<D: Document> IndexWriter<D> {
 
         let mut delete_cursor = self.delete_queue.cursor();
 
-        let mem_budget = self.options.memory_budget_per_thread;
+        let mem_budget = self.memory_budget.clone();
         let index = self.index.clone();
         let low_priority = self.options.low_priority_threads;
         let join_handle: JoinHandle<crate::Result<()>> = thread::Builder::new()
             .name(format!("thrd-tantivy-index{}", self.worker_id))
             .spawn(move || {
-                if low_priority {
-                    crate::indexer::thread_priority::lower_current_thread_priority();
-                }
+                let _background = low_priority.then(super::BackgroundPriority::enter);
                 loop {
                     let mut document_iterator = document_receiver_clone
                         .clone()
@@ -460,7 +520,7 @@ impl<D: Document> IndexWriter<D> {
                     }
 
                     index_documents(
-                        mem_budget,
+                        &mem_budget,
                         index.new_segment(),
                         &mut document_iterator,
                         &segment_updater,
@@ -547,7 +607,8 @@ impl<D: Document> IndexWriter<D> {
     pub fn merge(&mut self, segment_ids: &[SegmentId]) -> FutureResult<Option<SegmentMeta>> {
         let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
         let segment_updater = self.segment_updater.clone();
-        segment_updater.start_merge(merge_operation)
+        // a caller waits for this merge: normal priority
+        segment_updater.start_merge(merge_operation, false)
     }
 
     /// Closes the current document channel send.
@@ -586,8 +647,12 @@ impl<D: Document> IndexWriter<D> {
             .take()
             .expect("The IndexWriter does not have any lock. This is a bug, please report.");
 
-        let new_index_writer =
-            IndexWriter::new(self.index.clone(), self.options.clone(), directory_lock)?;
+        let new_index_writer = IndexWriter::with_memory_budget(
+            self.index.clone(),
+            self.options.clone(),
+            directory_lock,
+            self.memory_budget.clone(),
+        )?;
 
         // the current `self` is dropped right away because of this call.
         //
@@ -2387,7 +2452,9 @@ mod tests {
                 assert!(is_sorted(&ids_in_segment));
 
                 fn is_sorted<T>(data: &[T]) -> bool
-                where T: Ord {
+                where
+                    T: Ord,
+                {
                     data.windows(2).all(|w| w[0] <= w[1])
                 }
             }
@@ -2882,5 +2949,38 @@ mod tests {
             "Writer should reject options with too high memory size"
         );
         assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+    }
+
+    fn segments_after_lowering_budget(lower: bool) -> usize {
+        let mut schema_builder = schema::Schema::builder();
+        let text = schema_builder.add_text_field("text", schema::TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let options = IndexWriterOptions::builder()
+            .num_worker_threads(1)
+            .memory_budget_per_thread(1 << 30)
+            .build();
+        let mut writer: IndexWriter = index.writer_with_options(options).unwrap();
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let budget = writer.memory_budget();
+        let add = |from: usize, to: usize| {
+            for i in from..to {
+                let words: Vec<String> = (0..10).map(|j| format!("w{i}x{j}")).collect();
+                writer.add_document(doc!(text => words.join(" "))).unwrap();
+            }
+        };
+        // ~1M distinct terms: far above the minimum budget
+        add(0, 100_000);
+        if lower {
+            assert_eq!(budget.set_per_thread(0), MEMORY_BUDGET_NUM_BYTES_MIN);
+        }
+        add(100_000, 100_010);
+        writer.commit().unwrap();
+        index.searchable_segment_ids().unwrap().len()
+    }
+
+    #[test]
+    fn test_lowering_the_memory_budget_flushes_the_segment() {
+        assert_eq!(segments_after_lowering_budget(false), 1);
+        assert!(segments_after_lowering_budget(true) >= 2);
     }
 }

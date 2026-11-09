@@ -100,7 +100,7 @@ serde-tuple-vec-map = "1.0.1"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["processthreadsapi", "winbase"] }
 
-[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

@@ -28,13 +28,13 @@ pub(crate) mod segment_updater;
 pub(crate) mod segment_writer;
 pub(crate) mod single_segment_index_writer;
 mod stamper;
-mod thread_priority;
+pub mod thread_priority;
 
 use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
 pub use self::doc_id_mapping::DocIdMapping;
-pub use self::index_writer::{advance_deletes, IndexWriter, IndexWriterOptions};
+pub use self::index_writer::{advance_deletes, IndexWriter, IndexWriterOptions, MemoryBudget};
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
@@ -44,6 +44,7 @@ pub use self::segment_entry::SegmentEntry;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};
 pub use self::segment_writer::SegmentWriter;
 pub use self::single_segment_index_writer::SingleSegmentIndexWriter;
+pub use self::thread_priority::{BackgroundPriority, NormalPrioritySection};
 
 /// Alias for the default merge policy, which is the `LogMergePolicy`.
 pub type DefaultMergePolicy = LogMergePolicy;

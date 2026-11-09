@@ -289,6 +289,7 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
+    low_priority_threads: bool,
 }
 
 impl SegmentUpdater {
@@ -313,11 +314,6 @@ impl SegmentUpdater {
         let merge_thread_pool = ThreadPoolBuilder::new()
             .thread_name(|i| format!("merge_thread_{i}"))
             .num_threads(num_merge_threads)
-            .start_handler(move |_| {
-                if low_priority_threads {
-                    super::thread_priority::lower_current_thread_priority();
-                }
-            })
             .panic_handler(move |panic| {
                 // We don't print the panic content itself,
                 // it is already printed during the unwinding
@@ -344,6 +340,7 @@ impl SegmentUpdater {
             killed: AtomicBool::new(false),
             stamper,
             merge_operations: Default::default(),
+            low_priority_threads,
         })))
     }
 
@@ -516,10 +513,16 @@ impl SegmentUpdater {
     // suggested and the moment when it ended up being executed.)
     //
     // `segment_ids` is required to be non-empty.
+    //
+    // `background`: the merge runs in the OS background mode when the writer has
+    // `low_priority_threads` (merges the merge policy starts; an explicitly
+    // requested merge has a caller waiting for it and runs at normal priority).
     pub fn start_merge(
         &self,
         merge_operation: MergeOperation,
+        background: bool,
     ) -> FutureResult<Option<SegmentMeta>> {
+        let background = background && self.low_priority_threads;
         assert!(
             !merge_operation.segment_ids().is_empty(),
             "Segment_ids cannot be empty."
@@ -545,6 +548,7 @@ impl SegmentUpdater {
             FutureResult::create("Merge operation failed.");
 
         self.merge_thread_pool.spawn(move || {
+            let _background = background.then(super::BackgroundPriority::enter);
             // The fact that `merge_operation` is moved here is important.
             // Its lifetime is used to track how many merging thread are currently running,
             // as well as which segment is currently in merge and therefore should not be
@@ -638,7 +642,7 @@ impl SegmentUpdater {
         for merge_operation in merge_candidates {
             // If a merge cannot be started this is not a fatal error.
             // We do log a warning in `start_merge`.
-            drop(self.start_merge(merge_operation));
+            drop(self.start_merge(merge_operation, true));
         }
     }
 
