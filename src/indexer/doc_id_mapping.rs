@@ -19,6 +19,10 @@ pub enum MappingType {
     StackedWithDeletes,
     /// Documents are reordered instead of preserving source segment order.
     Shuffled,
+    /// Documents are in an arbitrary order chosen by the caller
+    /// ([`IndexWriter::merge_reordered`](crate::IndexWriter::merge_reordered)): unlike
+    /// `Shuffled`, the new doc ids of one source segment need not increase with its old ones.
+    Reordered,
 }
 
 /// Struct to provide mapping from new doc_id to old doc_id and segment.
@@ -67,7 +71,7 @@ impl SegmentDocIdMapping {
     pub(crate) fn is_trivial(&self) -> bool {
         match self.mapping_type {
             MappingType::Stacked | MappingType::StackedWithDeletes => true,
-            MappingType::Shuffled => false,
+            MappingType::Shuffled | MappingType::Reordered => false,
         }
     }
 }

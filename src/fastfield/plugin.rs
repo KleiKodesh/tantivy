@@ -156,7 +156,7 @@ fn convert_to_merge_order(
 ) -> MergeRowOrder {
     match doc_id_mapping.mapping_type() {
         MappingType::Stacked => MergeRowOrder::Stack(StackMergeOrder::stack(columnars)),
-        MappingType::StackedWithDeletes | MappingType::Shuffled => {
+        MappingType::StackedWithDeletes | MappingType::Shuffled | MappingType::Reordered => {
             let new_row_id_to_old_row_id: Vec<RowAddr> = doc_id_mapping
                 .new_doc_id_to_old_doc_addr
                 .into_iter()

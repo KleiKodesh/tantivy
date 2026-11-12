@@ -20,6 +20,7 @@ use crate::indexer::delete_queue::DeleteCursor;
 use crate::indexer::index_writer::advance_deletes;
 use crate::indexer::merge_operation::MergeOperationInventory;
 use crate::indexer::merger::IndexMerger;
+use crate::indexer::reorder::Reorder;
 use crate::indexer::segment_manager::SegmentsStatus;
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{
@@ -86,6 +87,7 @@ fn merge(
     index: &Index,
     mut segment_entries: Vec<SegmentEntry>,
     target_opstamp: Opstamp,
+    reorder: Option<Reorder>,
 ) -> crate::Result<Option<SegmentEntry>> {
     let num_docs = segment_entries
         .iter()
@@ -116,7 +118,12 @@ fn merge(
         IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let num_docs = merger.write(&merged_segment)?;
+    let num_docs = match reorder {
+        Some(Reorder { plan, control }) => {
+            merger.write_reordered(&merged_segment, plan, &control)?
+        }
+        None => merger.write(&merged_segment)?,
+    };
 
     let merged_segment_id = merged_segment.id();
 
@@ -522,6 +529,16 @@ impl SegmentUpdater {
         merge_operation: MergeOperation,
         background: bool,
     ) -> FutureResult<Option<SegmentMeta>> {
+        self.start_merge_with(merge_operation, background, None)
+    }
+
+    // `start_merge`, writing the merged segment in the order of `reorder` when given.
+    pub(crate) fn start_merge_with(
+        &self,
+        merge_operation: MergeOperation,
+        background: bool,
+        reorder: Option<Reorder>,
+    ) -> FutureResult<Option<SegmentMeta>> {
         let background = background && self.low_priority_threads;
         assert!(
             !merge_operation.segment_ids().is_empty(),
@@ -546,6 +563,8 @@ impl SegmentUpdater {
 
         let (scheduled_result, merging_future_send) =
             FutureResult::create("Merge operation failed.");
+        // a reordering merge fails on purpose when cancelled (tests cover it)
+        let reordered = reorder.is_some();
 
         self.merge_thread_pool.spawn(move || {
             let _background = background.then(super::BackgroundPriority::enter);
@@ -558,6 +577,7 @@ impl SegmentUpdater {
                     &segment_updater.index,
                     segment_entries,
                     merge_operation.target_opstamp(),
+                    reorder,
                 )
             }));
             let merge_res = match merge_panic_res {
@@ -591,7 +611,7 @@ impl SegmentUpdater {
                         merge_operation.segment_ids().to_vec(),
                         merge_error
                     );
-                    if cfg!(test) {
+                    if cfg!(test) && !reordered {
                         panic!("{merge_error:?}");
                     }
                     let _send_result = merging_future_send.send(Err(merge_error));

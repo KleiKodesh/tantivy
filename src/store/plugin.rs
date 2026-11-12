@@ -10,7 +10,8 @@ use measure_time::debug_time;
 
 use crate::directory::Directory;
 use crate::index::{SegmentComponent, SegmentReader};
-use crate::indexer::doc_id_mapping::DocIdMapping;
+use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType};
+use crate::indexer::reorder::ReorderStage;
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::schema::document::Document;
 use crate::schema::Schema;
@@ -44,7 +45,30 @@ impl SegmentPlugin for StorePlugin {
             settings.docstore_compress_dedicated_thread,
         )?;
 
-        if !ctx.doc_id_mapping.is_trivial() {
+        if ctx.doc_id_mapping.mapping_type() == MappingType::Reordered {
+            // the new doc ids of a segment do not increase with its old ones: read each doc
+            // by its address
+            let store_readers: Vec<_> = ctx
+                .readers
+                .iter()
+                .map(|reader| reader.get_store_reader(50))
+                .collect::<Result<_, _>>()?;
+            let total = ctx.doc_id_mapping.new_doc_id_to_old_doc_addr.len() as u64;
+            for (done, old_doc_addr) in ctx.doc_id_mapping.iter_old_doc_addrs().enumerate() {
+                if done % 65_536 == 0 {
+                    if let Some(control) = ctx.reorder {
+                        control.check()?;
+                        control.report(ReorderStage::Store, done as u64, total);
+                    }
+                }
+                let doc_bytes = store_readers[old_doc_addr.segment_ord as usize]
+                    .get_document_bytes(old_doc_addr.doc_id)?;
+                store_writer.store_bytes(&doc_bytes)?;
+            }
+            if let Some(control) = ctx.reorder {
+                control.report(ReorderStage::Store, total, total);
+            }
+        } else if !ctx.doc_id_mapping.is_trivial() {
             debug!("non-trivial-doc-id-mapping");
 
             let store_readers: Vec<_> = ctx

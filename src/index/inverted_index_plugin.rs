@@ -21,8 +21,9 @@ use crate::docset::DocSet;
 use crate::error::DataCorruption;
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders, FieldNormsSerializer, FieldNormsWriter};
 use crate::index::{Segment, SegmentComponent, SegmentReader};
-use crate::indexer::doc_id_mapping::{DocIdMapping, SegmentDocIdMapping};
+use crate::indexer::doc_id_mapping::{DocIdMapping, MappingType, SegmentDocIdMapping};
 use crate::indexer::indexing_term::IndexingTerm;
+use crate::indexer::reorder::{ReorderControl, ReorderStage};
 use crate::json_utils::{index_json_value, IndexingPositionsPerPath};
 use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 use crate::postings::{
@@ -86,6 +87,7 @@ impl SegmentPlugin for InvertedIndexPlugin {
             &mut serializer,
             fieldnorm_readers,
             ctx.doc_id_mapping,
+            ctx.reorder,
         )?;
         serializer.close()?;
         Ok(())
@@ -549,10 +551,14 @@ fn write_postings_for_field(
     serializer: &mut InvertedIndexSerializer,
     fieldnorm_reader: Option<FieldNormReader>,
     doc_id_mapping: &SegmentDocIdMapping,
+    mut progress: Option<&mut TermProgress>,
 ) -> crate::Result<()> {
     debug_time!("write-postings-for-field");
     let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
     let mut delta_computer = DeltaComputer::new();
+    // a reordering merge's per-term buffers: (new doc, term freq, positions range)
+    let mut reordered_docs: Vec<(DocId, u32, usize, usize)> = Vec::new();
+    let mut reordered_positions: Vec<u32> = Vec::new();
 
     let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
 
@@ -646,7 +652,33 @@ fn write_postings_for_field(
 
         field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-        if doc_id_mapping.is_trivial() {
+        if doc_id_mapping.mapping_type() == MappingType::Reordered {
+            // the new doc ids of a segment do not increase with its old ones: collect the
+            // term's docs (positions in one flat buffer), sort them by new doc id, write
+            reordered_docs.clear();
+            reordered_positions.clear();
+            for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
+                let mapping = &merged_doc_id_map[segment_ord];
+                while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
+                    let start = reordered_positions.len();
+                    let term_freq = if has_term_freq {
+                        postings.positions(&mut positions_buffer);
+                        reordered_positions.extend_from_slice(&positions_buffer);
+                        postings.term_freq()
+                    } else {
+                        0
+                    };
+                    reordered_docs.push((doc, term_freq, start, reordered_positions.len()));
+                    postings.advance();
+                }
+            }
+            reordered_docs.sort_unstable_by_key(|&(doc, ..)| doc);
+            for &(doc, term_freq, start, end) in &reordered_docs {
+                let delta_positions =
+                    delta_computer.compute_delta(&reordered_positions[start..end]);
+                field_serializer.write_doc(doc, term_freq, delta_positions);
+            }
+        } else if doc_id_mapping.is_trivial() {
             for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
                 let mapping = &merged_doc_id_map[segment_ord];
                 while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
@@ -677,6 +709,9 @@ fn write_postings_for_field(
             }
         }
         field_serializer.close_term()?;
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.term_done()?;
+        }
     }
     field_serializer.close()?;
     Ok(())
@@ -688,7 +723,27 @@ fn write_postings_merge(
     serializer: &mut InvertedIndexSerializer,
     fieldnorm_readers: FieldNormReaders,
     doc_id_mapping: &SegmentDocIdMapping,
+    reorder: Option<&ReorderControl>,
 ) -> crate::Result<()> {
+    // progress of a reordering merge: terms of all indexed fields (an upper bound when
+    // segments share terms)
+    let mut progress = reorder.map(|control| {
+        let mut total = 0u64;
+        for (field, field_entry) in schema.fields() {
+            if field_entry.is_indexed() {
+                for reader in readers {
+                    if let Ok(inverted) = reader.inverted_index(field) {
+                        total += inverted.terms().num_terms() as u64;
+                    }
+                }
+            }
+        }
+        TermProgress {
+            control,
+            done: 0,
+            total,
+        }
+    });
     for (field, field_entry) in schema.fields() {
         let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
         if field_entry.is_indexed() {
@@ -699,10 +754,36 @@ fn write_postings_merge(
                 serializer,
                 fieldnorm_reader,
                 doc_id_mapping,
+                progress.as_mut(),
             )?;
         }
     }
+    if let Some(p) = progress {
+        p.control.report(ReorderStage::Postings, p.total, p.total);
+    }
     Ok(())
+}
+
+/// Cancellation checks and progress reports of a reordering merge, every few terms.
+struct TermProgress<'a> {
+    control: &'a ReorderControl,
+    done: u64,
+    total: u64,
+}
+
+impl TermProgress<'_> {
+    fn term_done(&mut self) -> crate::Result<()> {
+        self.done += 1;
+        if self.done % 4096 == 0 {
+            self.control.check()?;
+            self.control.report(
+                ReorderStage::Postings,
+                self.done.min(self.total),
+                self.total,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

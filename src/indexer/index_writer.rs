@@ -18,6 +18,7 @@ use crate::indexer::delete_queue::{DeleteCursor, DeleteQueue};
 use crate::indexer::doc_opstamp_mapping::DocToOpstampMapping;
 use crate::indexer::index_writer_status::IndexWriterStatus;
 use crate::indexer::operation::DeleteOperation;
+use crate::indexer::reorder::{Reorder, ReorderControl, ReorderPlanFn};
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
@@ -609,6 +610,31 @@ impl<D: Document> IndexWriter<D> {
         let segment_updater = self.segment_updater.clone();
         // a caller waits for this merge: normal priority
         segment_updater.start_merge(merge_operation, false)
+    }
+
+    /// Merges the given segments into one segment whose docs are in the order `plan`
+    /// returns, instead of the order of the index's sort field (or the segments' order).
+    ///
+    /// `plan` runs on the merge thread with the readers of the merged segments (alive docs
+    /// only) and returns every alive doc once, in the new order, and optionally new values
+    /// for `u64` fast fields (one per new doc). When the index has a sort field, the new
+    /// order must be sorted by it (replace its values in the plan to renumber it);
+    /// otherwise the merge fails. The merge publishes like [`merge`](Self::merge): the
+    /// merged segments stay until the new one is complete. `control` cancels the merge (it
+    /// then fails and changes nothing) and reports its progress. It runs at background
+    /// priority when the writer was created with `low_priority_threads`.
+    ///
+    /// The postings of each term are sorted in memory, so the merge needs memory for the
+    /// largest term's postings and positions, on top of a regular merge.
+    pub fn merge_reordered(
+        &mut self,
+        segment_ids: &[SegmentId],
+        plan: ReorderPlanFn,
+        control: ReorderControl,
+    ) -> FutureResult<Option<SegmentMeta>> {
+        let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
+        let segment_updater = self.segment_updater.clone();
+        segment_updater.start_merge_with(merge_operation, true, Some(Reorder { plan, control }))
     }
 
     /// Closes the current document channel send.

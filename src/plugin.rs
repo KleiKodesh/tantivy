@@ -144,6 +144,10 @@ pub struct PluginMergeContext<'a> {
     pub schema: &'a Schema,
     /// Settings of the target index.
     pub settings: &'a IndexSettings,
+    /// Cancellation and progress of a reordering merge
+    /// ([`IndexWriter::merge_reordered`](crate::IndexWriter::merge_reordered)); `None` for
+    /// other merges. A plugin may check it during a long merge.
+    pub reorder: Option<&'a crate::indexer::ReorderControl>,
 }
 
 #[cfg(test)]

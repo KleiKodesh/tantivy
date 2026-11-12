@@ -7,6 +7,7 @@ use itertools::Itertools;
 use crate::fastfield::{AliveBitSet, FastFieldNotAvailableError};
 use crate::index::{builtin_plugins, Segment, SegmentReader};
 use crate::indexer::doc_id_mapping::{MappingType, SegmentDocIdMapping};
+use crate::indexer::reorder::{ReorderControl, ReorderPlan, ReorderPlanFn, ReorderStage};
 use crate::plugin::{PluginMergeContext, SegmentPlugin};
 use crate::schema::{Schema, Type};
 use crate::termdict::TermOrdinal;
@@ -533,10 +534,253 @@ impl IndexMerger {
                 target_segment,
                 schema: &self.schema,
                 settings: &self.index_settings,
+                reorder: None,
             })?;
         }
 
         Ok(self.max_doc)
+    }
+}
+
+impl IndexMerger {
+    /// Writes the merged segment in the doc order of a reorder plan (see
+    /// [`IndexWriter::merge_reordered`](crate::IndexWriter::merge_reordered)).
+    pub(crate) fn write_reordered(
+        &self,
+        target_segment: &Segment,
+        plan_fn: ReorderPlanFn,
+        control: &ReorderControl,
+    ) -> crate::Result<u32> {
+        control.check()?;
+        control.report(ReorderStage::Plan, 0, 1);
+        let plan = plan_fn(&self.readers)?;
+        control.report(ReorderStage::Plan, 1, 1);
+        control.check()?;
+        self.check_plan(&plan)?;
+        let ReorderPlan {
+            new_to_old,
+            fast_field_values,
+        } = plan;
+        let num_docs = new_to_old.len() as u32;
+        let doc_id_mapping = SegmentDocIdMapping::new(
+            new_to_old,
+            MappingType::Reordered,
+            self.collect_alive_bitsets(),
+        );
+        for plugin in builtin_plugins()
+            .into_iter()
+            .chain(self.custom_plugins.iter().cloned())
+        {
+            control.check()?;
+            let is_fast = plugin.extensions() == ["fast"];
+            if is_fast {
+                control.report(ReorderStage::FastFields, 0, 1);
+            }
+            if is_fast && !fast_field_values.is_empty() {
+                self.write_fast_fields_reordered(
+                    target_segment,
+                    &doc_id_mapping,
+                    &fast_field_values,
+                )?;
+            } else {
+                plugin.merge(PluginMergeContext {
+                    readers: &self.readers,
+                    doc_id_mapping: &doc_id_mapping,
+                    target_segment,
+                    schema: &self.schema,
+                    settings: &self.index_settings,
+                    reorder: Some(control),
+                })?;
+            }
+            if is_fast {
+                control.report(ReorderStage::FastFields, 1, 1);
+            }
+        }
+        control.check()?;
+        Ok(num_docs)
+    }
+
+    /// Every alive doc exactly once; replaced fast fields are `u64` fast fields with one
+    /// value per doc; the new order is sorted by the index's sort field, if it has one.
+    fn check_plan(&self, plan: &ReorderPlan) -> crate::Result<()> {
+        let bad = |msg: String| Err(crate::TantivyError::InvalidArgument(msg));
+        if plan.new_to_old.len() != self.max_doc as usize {
+            return bad(format!(
+                "reorder plan has {} docs, the merged segments have {} alive docs",
+                plan.new_to_old.len(),
+                self.max_doc
+            ));
+        }
+        let mut seen: Vec<common::BitSet> = self
+            .readers
+            .iter()
+            .map(|r| common::BitSet::with_max_value(r.max_doc()))
+            .collect();
+        for addr in &plan.new_to_old {
+            let Some(reader) = self.readers.get(addr.segment_ord as usize) else {
+                return bad(format!(
+                    "reorder plan: no segment ordinal {}",
+                    addr.segment_ord
+                ));
+            };
+            if addr.doc_id >= reader.max_doc() || reader.is_deleted(addr.doc_id) {
+                return bad(format!("reorder plan: {addr:?} is not an alive doc"));
+            }
+            let set = &mut seen[addr.segment_ord as usize];
+            if set.contains(addr.doc_id) {
+                return bad(format!("reorder plan: {addr:?} appears twice"));
+            }
+            set.insert(addr.doc_id);
+        }
+        for (name, values) in &plan.fast_field_values {
+            let field = self.schema.get_field(name)?;
+            let entry = self.schema.get_field_entry(field);
+            if !entry.is_fast() || entry.field_type().value_type() != Type::U64 {
+                return bad(format!("reorder plan: {name} is not a u64 fast field"));
+            }
+            if values.len() != plan.new_to_old.len() {
+                return bad(format!("reorder plan: {name} needs one value per doc"));
+            }
+        }
+        if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref() {
+            let replaced = plan
+                .fast_field_values
+                .iter()
+                .find(|(name, _)| *name == sort_by_field.field)
+                .map(|(_, values)| values);
+            let columns = match replaced {
+                Some(_) => Vec::new(),
+                None => self
+                    .readers
+                    .iter()
+                    .map(|reader| Self::get_numeric_accessor(reader, sort_by_field))
+                    .collect::<crate::Result<Vec<_>>>()?,
+            };
+            let value = |new_doc: usize| match replaced {
+                Some(values) => Some(values[new_doc]),
+                None => {
+                    let addr = plan.new_to_old[new_doc];
+                    columns[addr.segment_ord as usize].first(addr.doc_id)
+                }
+            };
+            let asc = sort_by_field.order.is_asc();
+            let mut previous = None;
+            for new_doc in 0..plan.new_to_old.len() {
+                let current = value(new_doc);
+                let out_of_order = if asc {
+                    current < previous
+                } else {
+                    current > previous
+                };
+                if new_doc > 0 && out_of_order {
+                    return bad(format!(
+                        "reorder plan: the new order is not sorted by the index sort field {} \
+                         (new doc {new_doc})",
+                        sort_by_field.field
+                    ));
+                }
+                previous = current;
+            }
+        }
+        Ok(())
+    }
+
+    /// Fast fields in the new order, with the plan's replaced values (numeric and bool
+    /// fast fields only).
+    fn write_fast_fields_reordered(
+        &self,
+        target_segment: &Segment,
+        doc_id_mapping: &SegmentDocIdMapping,
+        replaced: &[(String, Vec<u64>)],
+    ) -> crate::Result<()> {
+        use columnar::{ColumnType, ColumnarWriter};
+        use common::TerminatingWrite;
+
+        use crate::Directory;
+
+        fn copy<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static>(
+            wrt: &mut ColumnarWriter,
+            name: &str,
+            columns: &[Column<T>],
+            doc_id_mapping: &SegmentDocIdMapping,
+            record: impl Fn(&mut ColumnarWriter, DocId, &str, T),
+        ) {
+            for (new_doc, addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
+                for value in columns[addr.segment_ord as usize].values_for_doc(addr.doc_id) {
+                    record(wrt, new_doc as DocId, name, value);
+                }
+            }
+        }
+
+        let mut wrt = ColumnarWriter::default();
+        let num_docs = doc_id_mapping.new_doc_id_to_old_doc_addr.len() as DocId;
+        for (_, entry) in self.schema.fields().filter(|(_, e)| e.is_fast()) {
+            let name = entry.name();
+            if let Some((_, values)) = replaced.iter().find(|(n, _)| n == name) {
+                wrt.record_column_type(name, ColumnType::U64, false);
+                for (new_doc, value) in values.iter().enumerate() {
+                    wrt.record_numerical(new_doc as DocId, name, *value);
+                }
+                continue;
+            }
+            match entry.field_type().value_type() {
+                Type::U64 => {
+                    wrt.record_column_type(name, ColumnType::U64, false);
+                    let cols = self
+                        .readers
+                        .iter()
+                        .map(|r| r.fast_fields().u64(name))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
+                        w.record_numerical(d, n, v)
+                    });
+                }
+                Type::I64 => {
+                    wrt.record_column_type(name, ColumnType::I64, false);
+                    let cols = self
+                        .readers
+                        .iter()
+                        .map(|r| r.fast_fields().i64(name))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
+                        w.record_numerical(d, n, v)
+                    });
+                }
+                Type::F64 => {
+                    wrt.record_column_type(name, ColumnType::F64, false);
+                    let cols = self
+                        .readers
+                        .iter()
+                        .map(|r| r.fast_fields().f64(name))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
+                        w.record_numerical(d, n, v)
+                    });
+                }
+                Type::Bool => {
+                    wrt.record_column_type(name, ColumnType::Bool, false);
+                    let cols = self
+                        .readers
+                        .iter()
+                        .map(|r| r.fast_fields().bool(name))
+                        .collect::<crate::Result<Vec<_>>>()?;
+                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
+                        w.record_bool(d, n, v)
+                    });
+                }
+                other => {
+                    return Err(crate::TantivyError::InvalidArgument(format!(
+                        "a reordering merge that replaces fast field values supports numeric \
+                         and bool fast fields only; {name} is {other:?}"
+                    )));
+                }
+            }
+        }
+        let path = target_segment.relative_path(crate::index::SegmentComponent::FastFields);
+        let mut out = target_segment.index().directory().open_write(&path)?;
+        wrt.serialize(num_docs, None, &mut out)?;
+        out.terminate()?;
+        Ok(())
     }
 }
 
