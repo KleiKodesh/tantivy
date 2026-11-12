@@ -12,7 +12,10 @@ pub struct SimpleUnion<TDocSet> {
 }
 
 impl<TDocSet: DocSet> SimpleUnion<TDocSet> {
-    pub(crate) fn build(mut docsets: Vec<TDocSet>) -> SimpleUnion<TDocSet> {
+    /// The union of `docsets`, positioned on its first doc. Over `Postings`
+    /// it is itself a `Postings`: term frequencies summed, positions merged
+    /// (sorted, deduplicated).
+    pub fn build(mut docsets: Vec<TDocSet>) -> SimpleUnion<TDocSet> {
         docsets.retain(|docset| docset.doc() != TERMINATED);
         let mut docset = SimpleUnion { docsets, doc: 0 };
 
