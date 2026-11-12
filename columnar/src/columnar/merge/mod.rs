@@ -12,14 +12,16 @@ pub use merge_mapping::{MergeRowOrder, ShuffleMergeOrder, StackMergeOrder};
 
 use super::writer::ColumnarSerializer;
 use crate::column::{serialize_column_mappable_to_u64, serialize_column_mappable_to_u128};
+use crate::column_index::SerializableColumnIndex;
 use crate::column_values::MergedColumnValues;
 use crate::columnar::ColumnarReader;
 use crate::columnar::merge::merge_dict_column::merge_bytes_or_str_column;
 use crate::columnar::writer::CompatibleNumericalTypes;
 use crate::dynamic_column::DynamicColumn;
+use crate::iterable::Iterable;
 use crate::{
     BytesColumn, Column, ColumnIndex, ColumnType, ColumnValues, DynamicColumnHandle, NumericalType,
-    NumericalValue,
+    NumericalValue, RowAddr,
 };
 
 /// Column types are grouped into different categories.
@@ -80,6 +82,29 @@ pub fn merge_columnar(
     merge_row_order: MergeRowOrder,
     output: &mut impl io::Write,
 ) -> io::Result<()> {
+    merge_columnar_replacing(
+        columnar_readers,
+        required_columns,
+        merge_row_order,
+        &[],
+        output,
+    )
+}
+
+/// A `u64` value per row, computed from the row's address in the merged columnars.
+pub type RowValueFn<'a> = &'a (dyn Fn(RowAddr) -> u64 + Sync);
+
+/// [`merge_columnar`] that writes the given numerical columns with new values instead of
+/// merging them: `replaced` holds `(column name, value of each row)`; each such column is
+/// written as a full `u64` column (one value per row of the merged columnar), computed while
+/// it is serialized, so the values are never held in memory at once.
+pub fn merge_columnar_replacing(
+    columnar_readers: &[&ColumnarReader],
+    required_columns: &[(String, ColumnType)],
+    merge_row_order: MergeRowOrder,
+    replaced: &[(&str, RowValueFn)],
+    output: &mut impl io::Write,
+) -> io::Result<()> {
     let mut serializer = ColumnarSerializer::new(output);
     let num_docs_per_columnar = columnar_readers
         .iter()
@@ -87,8 +112,33 @@ pub fn merge_columnar(
         .collect::<Vec<u32>>();
 
     let columns_to_merge = group_columns_for_merge(columnar_readers, required_columns)?;
+    if let Some((name, _)) = replaced.iter().find(|(name, _)| {
+        !columns_to_merge.contains_key(&(name.to_string(), ColumnTypeCategory::Numerical))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("replaced column {name} is not a numerical column of the merged columnars"),
+        ));
+    }
     for res in columns_to_merge {
-        let ((column_name, _column_type_category), grouped_columns) = res;
+        let ((column_name, column_type_category), grouped_columns) = res;
+        if column_type_category == ColumnTypeCategory::Numerical {
+            if let Some((_, value_fn)) = replaced.iter().find(|(name, _)| *name == column_name) {
+                let mut column_serializer =
+                    serializer.start_serialize_column(column_name.as_bytes(), ColumnType::U64);
+                let values = ReplacedValues {
+                    merge_row_order: &merge_row_order,
+                    value_fn: *value_fn,
+                };
+                serialize_column_mappable_to_u64(
+                    SerializableColumnIndex::Full,
+                    &values,
+                    &mut column_serializer,
+                )?;
+                column_serializer.finalize()?;
+                continue;
+            }
+        }
         let grouped_columns = grouped_columns.open(&merge_row_order)?;
         if grouped_columns.is_empty() {
             continue;
@@ -115,6 +165,34 @@ pub fn merge_columnar(
 
     serializer.finalize(merge_row_order.num_rows())?;
     Ok(())
+}
+
+/// The replacing values of a column, in the merged row order.
+struct ReplacedValues<'a> {
+    merge_row_order: &'a MergeRowOrder,
+    value_fn: RowValueFn<'a>,
+}
+
+impl Iterable<u64> for ReplacedValues<'_> {
+    fn boxed_iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
+        let value_fn = self.value_fn;
+        match self.merge_row_order {
+            MergeRowOrder::Stack(stack) => {
+                Box::new((0..stack.num_columnars()).flat_map(move |segment_ord| {
+                    let range = stack.columnar_range(segment_ord);
+                    (0..range.end - range.start).map(move |row_id| {
+                        value_fn(RowAddr {
+                            segment_ord: segment_ord as u32,
+                            row_id,
+                        })
+                    })
+                }))
+            }
+            MergeRowOrder::Shuffled(shuffle) => {
+                Box::new(shuffle.iter_new_to_old_row_addrs().map(value_fn))
+            }
+        }
+    }
 }
 
 fn dynamic_column_to_u64_monotonic(dynamic_column: DynamicColumn) -> Option<Column<u64>> {

@@ -7,7 +7,8 @@ use std::any::Any;
 use std::collections::BTreeMap;
 
 use columnar::{
-    ColumnType, ColumnarReader, MergeRowOrder, RowAddr, ShuffleMergeOrder, StackMergeOrder,
+    ColumnType, ColumnarReader, MergeRowOrder, RowAddr, RowValueFn, ShuffleMergeOrder,
+    StackMergeOrder,
 };
 use common::TerminatingWrite;
 use measure_time::debug_time;
@@ -35,33 +36,7 @@ impl SegmentPlugin for FastFieldsPlugin {
     }
 
     fn merge(&self, ctx: PluginMergeContext) -> crate::Result<()> {
-        debug_time!("write-fast-fields");
-        let path = ctx
-            .target_segment
-            .relative_path(SegmentComponent::FastFields);
-        let mut fast_field_wrt: WritePtr =
-            ctx.target_segment.index().directory().open_write(&path)?;
-
-        let required_columns = extract_fast_field_required_columns(ctx.schema);
-        let columnars: Vec<&ColumnarReader> = ctx
-            .readers
-            .iter()
-            .map(|reader| reader.fast_fields().columnar())
-            .collect();
-
-        // Clone the doc_id_mapping since convert_to_merge_order consumes it by value
-        let doc_id_mapping = ctx.doc_id_mapping.clone();
-        let merge_row_order = convert_to_merge_order(&columnars[..], doc_id_mapping);
-
-        columnar::merge_columnar(
-            &columnars[..],
-            &required_columns,
-            merge_row_order,
-            &mut fast_field_wrt,
-        )?;
-
-        fast_field_wrt.terminate()?;
-        Ok(())
+        merge_fast_fields(&ctx, &[])
     }
 
     fn space_usage(
@@ -77,6 +52,41 @@ impl SegmentPlugin for FastFieldsPlugin {
             ComponentSpaceUsage::PerField(usage),
         )]))
     }
+}
+
+/// Merges the fast fields; the columns named in `replaced` are written with the values
+/// their function gives each doc (by its address in the merged segments) instead.
+pub(crate) fn merge_fast_fields(
+    ctx: &PluginMergeContext,
+    replaced: &[(&str, RowValueFn)],
+) -> crate::Result<()> {
+    debug_time!("write-fast-fields");
+    let path = ctx
+        .target_segment
+        .relative_path(SegmentComponent::FastFields);
+    let mut fast_field_wrt: WritePtr = ctx.target_segment.index().directory().open_write(&path)?;
+
+    let required_columns = extract_fast_field_required_columns(ctx.schema);
+    let columnars: Vec<&ColumnarReader> = ctx
+        .readers
+        .iter()
+        .map(|reader| reader.fast_fields().columnar())
+        .collect();
+
+    // Clone the doc_id_mapping since convert_to_merge_order consumes it by value
+    let doc_id_mapping = ctx.doc_id_mapping.clone();
+    let merge_row_order = convert_to_merge_order(&columnars[..], doc_id_mapping);
+
+    columnar::merge_columnar_replacing(
+        &columnars[..],
+        &required_columns,
+        merge_row_order,
+        replaced,
+        &mut fast_field_wrt,
+    )?;
+
+    fast_field_wrt.terminate()?;
+    Ok(())
 }
 
 /// Accumulates and serializes fast-field values for a segment.

@@ -36,6 +36,11 @@ impl StackMergeOrder {
         self.cumulated_row_ids.last().copied().unwrap_or(0)
     }
 
+    /// The number of stacked columnars.
+    pub fn num_columnars(&self) -> usize {
+        self.cumulated_row_ids.len()
+    }
+
     pub fn offset(&self, columnar_id: usize) -> RowId {
         if columnar_id == 0 {
             return 0;

@@ -557,8 +557,12 @@ fn write_postings_for_field(
     let mut positions_buffer: Vec<u32> = Vec::with_capacity(1_000);
     let mut delta_computer = DeltaComputer::new();
     // a reordering merge's per-term buffers: (new doc, term freq, positions range)
-    let mut reordered_docs: Vec<(DocId, u32, usize, usize)> = Vec::new();
+    let mut reordered_docs: Vec<(DocId, u32, u32, u32)> = Vec::new();
     let mut reordered_positions: Vec<u32> = Vec::new();
+    // the term infos of the segments holding the current term (a reordering merge reads
+    // a big term's postings several times)
+    let mut term_infos: Vec<(usize, crate::postings::TermInfo)> = Vec::new();
+    let num_new_docs = doc_id_mapping.new_doc_id_to_old_doc_addr.len() as u64;
 
     let mut max_term_ords: Vec<TermOrdinal> = Vec::new();
 
@@ -606,6 +610,7 @@ fn write_postings_for_field(
 
     while merged_terms.advance() {
         segment_postings_containing_the_term.clear();
+        term_infos.clear();
         let term_bytes: &[u8] = merged_terms.key();
 
         let mut total_doc_freq = 0;
@@ -624,6 +629,7 @@ fn write_postings_for_field(
             if doc_freq > 0u32 {
                 total_doc_freq += doc_freq;
                 segment_postings_containing_the_term.push((segment_ord, segment_postings));
+                term_infos.push((segment_ord, term_info));
             }
         }
 
@@ -654,29 +660,62 @@ fn write_postings_for_field(
 
         if doc_id_mapping.mapping_type() == MappingType::Reordered {
             // the new doc ids of a segment do not increase with its old ones: collect the
-            // term's docs (positions in one flat buffer), sort them by new doc id, write
-            reordered_docs.clear();
-            reordered_positions.clear();
-            for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
-                let mapping = &merged_doc_id_map[segment_ord];
-                while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
-                    let start = reordered_positions.len();
-                    let term_freq = if has_term_freq {
-                        postings.positions(&mut positions_buffer);
-                        reordered_positions.extend_from_slice(&positions_buffer);
-                        postings.term_freq()
+            // term's docs (positions in one flat buffer), sort them by new doc id, write.
+            // A big term goes in windows of new doc ids, its postings read once per window,
+            // so the buffers stay small (about REORDER_WINDOW_DOCS docs).
+            let passes = (total_doc_freq as u64).div_ceil(REORDER_WINDOW_DOCS).max(1);
+            let width = num_new_docs.div_ceil(passes).max(1);
+            for pass in 0..passes {
+                let (lo, hi) = (pass * width, ((pass + 1) * width).min(num_new_docs));
+                reordered_docs.clear();
+                reordered_positions.clear();
+                for (i, &(segment_ord, ref term_info)) in term_infos.iter().enumerate() {
+                    let mut postings = if pass == 0 {
+                        std::mem::replace(
+                            &mut segment_postings_containing_the_term[i].1,
+                            SegmentPostings::empty(),
+                        )
                     } else {
-                        0
+                        field_readers[segment_ord]
+                            .read_postings_from_terminfo(term_info, segment_postings_option)?
                     };
-                    reordered_docs.push((doc, term_freq, start, reordered_positions.len()));
-                    postings.advance();
+                    let mapping = &merged_doc_id_map[segment_ord];
+                    while let Some(doc) = crate::postings::next_mapped_doc(&mut postings, mapping) {
+                        if (lo..hi).contains(&(doc as u64)) {
+                            let start = u32::try_from(reordered_positions.len())
+                                .expect("under 4G positions per window");
+                            let term_freq = if has_term_freq {
+                                postings.positions(&mut positions_buffer);
+                                reordered_positions.extend_from_slice(&positions_buffer);
+                                postings.term_freq()
+                            } else {
+                                0
+                            };
+                            reordered_docs.push((
+                                doc,
+                                term_freq,
+                                start,
+                                u32::try_from(reordered_positions.len())
+                                    .expect("under 4G positions per window"),
+                            ));
+                        }
+                        postings.advance();
+                    }
+                }
+                reordered_docs.sort_unstable_by_key(|&(doc, ..)| doc);
+                for &(doc, term_freq, start, end) in &reordered_docs {
+                    let delta_positions = delta_computer
+                        .compute_delta(&reordered_positions[start as usize..end as usize]);
+                    field_serializer.write_doc(doc, term_freq, delta_positions);
                 }
             }
-            reordered_docs.sort_unstable_by_key(|&(doc, ..)| doc);
-            for &(doc, term_freq, start, end) in &reordered_docs {
-                let delta_positions =
-                    delta_computer.compute_delta(&reordered_positions[start..end]);
-                field_serializer.write_doc(doc, term_freq, delta_positions);
+            segment_postings_containing_the_term.clear();
+            // a big term's buffers are not kept for the next terms
+            if reordered_positions.capacity() > 4 * REORDER_WINDOW_DOCS as usize {
+                reordered_positions = Vec::new();
+            }
+            if reordered_docs.capacity() > 2 * REORDER_WINDOW_DOCS as usize {
+                reordered_docs = Vec::new();
             }
         } else if doc_id_mapping.is_trivial() {
             for (segment_ord, mut postings) in segment_postings_containing_the_term.drain(..) {
@@ -763,6 +802,14 @@ fn write_postings_merge(
     }
     Ok(())
 }
+
+/// The most docs a reordering merge buffers for one term at a time (a term with more docs
+/// is written in several windows of new doc ids).
+#[cfg(not(test))]
+const REORDER_WINDOW_DOCS: u64 = 1 << 18;
+// small in tests, so that the reorder tests write their terms in many windows
+#[cfg(test)]
+const REORDER_WINDOW_DOCS: u64 = 64;
 
 /// Cancellation checks and progress reports of a reordering merge, every few terms.
 struct TermProgress<'a> {

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use columnar::{compute_merged_term_ord_mapping, BytesColumn, Column};
+use columnar::{compute_merged_term_ord_mapping, BytesColumn, Column, RowAddr};
 use common::ReadOnlyBitSet;
 use itertools::Itertools;
 
@@ -576,21 +576,34 @@ impl IndexMerger {
             if is_fast {
                 control.report(ReorderStage::FastFields, 0, 1);
             }
+            let ctx = PluginMergeContext {
+                readers: &self.readers,
+                doc_id_mapping: &doc_id_mapping,
+                target_segment,
+                schema: &self.schema,
+                settings: &self.index_settings,
+                reorder: Some(control),
+            };
             if is_fast && !fast_field_values.is_empty() {
-                self.write_fast_fields_reordered(
-                    target_segment,
-                    &doc_id_mapping,
-                    &fast_field_values,
-                )?;
+                // the replaced columns are computed doc by doc while they are written
+                let value_fns: Vec<(&str, Box<dyn Fn(RowAddr) -> u64 + Sync + '_>)> =
+                    fast_field_values
+                        .iter()
+                        .map(|(name, value_fn)| {
+                            let row_fn: Box<dyn Fn(RowAddr) -> u64 + Sync + '_> =
+                                Box::new(move |row: RowAddr| {
+                                    value_fn(DocAddress::new(row.segment_ord, row.row_id))
+                                });
+                            (name.as_str(), row_fn)
+                        })
+                        .collect();
+                let replaced: Vec<(&str, columnar::RowValueFn)> = value_fns
+                    .iter()
+                    .map(|(name, row_fn)| (*name, &**row_fn as columnar::RowValueFn))
+                    .collect();
+                crate::fastfield::plugin::merge_fast_fields(&ctx, &replaced)?;
             } else {
-                plugin.merge(PluginMergeContext {
-                    readers: &self.readers,
-                    doc_id_mapping: &doc_id_mapping,
-                    target_segment,
-                    schema: &self.schema,
-                    settings: &self.index_settings,
-                    reorder: Some(control),
-                })?;
+                plugin.merge(ctx)?;
             }
             if is_fast {
                 control.report(ReorderStage::FastFields, 1, 1);
@@ -632,14 +645,11 @@ impl IndexMerger {
             }
             set.insert(addr.doc_id);
         }
-        for (name, values) in &plan.fast_field_values {
+        for (name, _) in &plan.fast_field_values {
             let field = self.schema.get_field(name)?;
             let entry = self.schema.get_field_entry(field);
             if !entry.is_fast() || entry.field_type().value_type() != Type::U64 {
                 return bad(format!("reorder plan: {name} is not a u64 fast field"));
-            }
-            if values.len() != plan.new_to_old.len() {
-                return bad(format!("reorder plan: {name} needs one value per doc"));
             }
         }
         if let Some(sort_by_field) = self.index_settings.sort_by_field.as_ref() {
@@ -647,7 +657,7 @@ impl IndexMerger {
                 .fast_field_values
                 .iter()
                 .find(|(name, _)| *name == sort_by_field.field)
-                .map(|(_, values)| values);
+                .map(|(_, value_fn)| value_fn);
             let columns = match replaced {
                 Some(_) => Vec::new(),
                 None => self
@@ -656,11 +666,11 @@ impl IndexMerger {
                     .map(|reader| Self::get_numeric_accessor(reader, sort_by_field))
                     .collect::<crate::Result<Vec<_>>>()?,
             };
-            let value = |new_doc: usize| match replaced {
-                Some(values) => Some(values[new_doc]),
-                None => {
-                    let addr = plan.new_to_old[new_doc];
-                    columns[addr.segment_ord as usize].first(addr.doc_id)
+            let value = |new_doc: usize| {
+                let addr = plan.new_to_old[new_doc];
+                match replaced {
+                    Some(value_fn) => Some(value_fn(addr)),
+                    None => columns[addr.segment_ord as usize].first(addr.doc_id),
                 }
             };
             let asc = sort_by_field.order.is_asc();
@@ -682,104 +692,6 @@ impl IndexMerger {
                 previous = current;
             }
         }
-        Ok(())
-    }
-
-    /// Fast fields in the new order, with the plan's replaced values (numeric and bool
-    /// fast fields only).
-    fn write_fast_fields_reordered(
-        &self,
-        target_segment: &Segment,
-        doc_id_mapping: &SegmentDocIdMapping,
-        replaced: &[(String, Vec<u64>)],
-    ) -> crate::Result<()> {
-        use columnar::{ColumnType, ColumnarWriter};
-        use common::TerminatingWrite;
-
-        use crate::Directory;
-
-        fn copy<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static>(
-            wrt: &mut ColumnarWriter,
-            name: &str,
-            columns: &[Column<T>],
-            doc_id_mapping: &SegmentDocIdMapping,
-            record: impl Fn(&mut ColumnarWriter, DocId, &str, T),
-        ) {
-            for (new_doc, addr) in doc_id_mapping.iter_old_doc_addrs().enumerate() {
-                for value in columns[addr.segment_ord as usize].values_for_doc(addr.doc_id) {
-                    record(wrt, new_doc as DocId, name, value);
-                }
-            }
-        }
-
-        let mut wrt = ColumnarWriter::default();
-        let num_docs = doc_id_mapping.new_doc_id_to_old_doc_addr.len() as DocId;
-        for (_, entry) in self.schema.fields().filter(|(_, e)| e.is_fast()) {
-            let name = entry.name();
-            if let Some((_, values)) = replaced.iter().find(|(n, _)| n == name) {
-                wrt.record_column_type(name, ColumnType::U64, false);
-                for (new_doc, value) in values.iter().enumerate() {
-                    wrt.record_numerical(new_doc as DocId, name, *value);
-                }
-                continue;
-            }
-            match entry.field_type().value_type() {
-                Type::U64 => {
-                    wrt.record_column_type(name, ColumnType::U64, false);
-                    let cols = self
-                        .readers
-                        .iter()
-                        .map(|r| r.fast_fields().u64(name))
-                        .collect::<crate::Result<Vec<_>>>()?;
-                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
-                        w.record_numerical(d, n, v)
-                    });
-                }
-                Type::I64 => {
-                    wrt.record_column_type(name, ColumnType::I64, false);
-                    let cols = self
-                        .readers
-                        .iter()
-                        .map(|r| r.fast_fields().i64(name))
-                        .collect::<crate::Result<Vec<_>>>()?;
-                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
-                        w.record_numerical(d, n, v)
-                    });
-                }
-                Type::F64 => {
-                    wrt.record_column_type(name, ColumnType::F64, false);
-                    let cols = self
-                        .readers
-                        .iter()
-                        .map(|r| r.fast_fields().f64(name))
-                        .collect::<crate::Result<Vec<_>>>()?;
-                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
-                        w.record_numerical(d, n, v)
-                    });
-                }
-                Type::Bool => {
-                    wrt.record_column_type(name, ColumnType::Bool, false);
-                    let cols = self
-                        .readers
-                        .iter()
-                        .map(|r| r.fast_fields().bool(name))
-                        .collect::<crate::Result<Vec<_>>>()?;
-                    copy(&mut wrt, name, &cols, doc_id_mapping, |w, d, n, v| {
-                        w.record_bool(d, n, v)
-                    });
-                }
-                other => {
-                    return Err(crate::TantivyError::InvalidArgument(format!(
-                        "a reordering merge that replaces fast field values supports numeric \
-                         and bool fast fields only; {name} is {other:?}"
-                    )));
-                }
-            }
-        }
-        let path = target_segment.relative_path(crate::index::SegmentComponent::FastFields);
-        let mut out = target_segment.index().directory().open_write(&path)?;
-        wrt.serialize(num_docs, None, &mut out)?;
-        out.terminate()?;
         Ok(())
     }
 }

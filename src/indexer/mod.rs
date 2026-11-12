@@ -41,7 +41,9 @@ pub use self::merge_operation::MergeOperation;
 pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 pub use self::operation::{AddOperation, DeleteOperation, UserOperation};
 pub use self::prepared_commit::PreparedCommit;
-pub use self::reorder::{ReorderControl, ReorderPlan, ReorderPlanFn, ReorderStage};
+pub use self::reorder::{
+    FastFieldValueFn, ReorderControl, ReorderPlan, ReorderPlanFn, ReorderStage,
+};
 pub use self::segment_entry::SegmentEntry;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};
 pub use self::segment_writer::SegmentWriter;

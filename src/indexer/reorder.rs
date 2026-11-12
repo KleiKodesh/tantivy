@@ -18,10 +18,17 @@ pub struct ReorderPlan {
     /// `new_to_old[new_doc]` = the doc's address in the merged segments; segment ordinals
     /// index the readers given to the plan function. Must hold every alive doc exactly once.
     pub new_to_old: Vec<DocAddress>,
-    /// Fast fields whose values are replaced: `(field name, value per new doc)`. The field
-    /// must be a single-valued `u64` fast field; each vector holds one value per new doc.
-    pub fast_field_values: Vec<(String, Vec<u64>)>,
+    /// Fast fields whose values are replaced: `(field name, new value of a doc)`, the
+    /// function called with the doc's address in the merged segments. The field must be a
+    /// single-valued `u64` fast field. The values are computed while the column is written
+    /// (never held at once), so the function is called several times per doc and must be
+    /// cheap and deterministic.
+    pub fast_field_values: Vec<(String, FastFieldValueFn)>,
 }
+
+/// The new value of a replaced fast field for a doc, given its address in the merged
+/// segments (see [`ReorderPlan::fast_field_values`]).
+pub type FastFieldValueFn = Box<dyn Fn(DocAddress) -> u64 + Send + Sync>;
 
 /// Builds the plan from the readers of the segments being merged (alive docs only).
 pub type ReorderPlanFn =
@@ -189,11 +196,16 @@ mod tests {
                 }
             }
             docs.sort_by(|a, b| b.0.cmp(&a.0));
-            let n = docs.len() as u64;
+            let new_doc: std::collections::HashMap<DocAddress, u64> = docs
+                .iter()
+                .enumerate()
+                .map(|(new, d)| (d.1, new as u64))
+                .collect();
             Ok(ReorderPlan {
                 new_to_old: docs.into_iter().map(|d| d.1).collect(),
                 fast_field_values: if renumber {
-                    vec![("rank".to_string(), (0..n).collect())]
+                    let value: super::FastFieldValueFn = Box::new(move |addr| new_doc[&addr]);
+                    vec![("rank".to_string(), value)]
                 } else {
                     Vec::new()
                 },

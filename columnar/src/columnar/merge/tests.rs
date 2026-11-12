@@ -637,3 +637,64 @@ proptest! {
 
     }
 }
+
+#[test]
+fn test_merge_columnar_replacing_a_column() {
+    let columnar1 = make_columnar("rank", &[10u64, 11, 12]);
+    let columnar2 = make_columnar("rank", &[20u64, 21]);
+    let columnars = &[&columnar1, &columnar2];
+    let value = |row: RowAddr| 100 * row.segment_ord as u64 + row.row_id as u64;
+    let read = |buffer: Vec<u8>| -> Vec<u64> {
+        let reader = ColumnarReader::open(buffer).unwrap();
+        let cols = reader.read_columns("rank").unwrap();
+        let DynamicColumn::U64(col) = cols[0].open().unwrap() else {
+            panic!("rank is u64");
+        };
+        (0..reader.num_docs())
+            .map(|row| col.first(row).unwrap())
+            .collect()
+    };
+    // stacked: every row in order
+    let mut buffer = Vec::new();
+    crate::columnar::merge_columnar_replacing(
+        columnars,
+        &[],
+        StackMergeOrder::stack(columnars).into(),
+        &[("rank", &value)],
+        &mut buffer,
+    )
+    .unwrap();
+    assert_eq!(read(buffer), vec![0, 1, 2, 100, 101]);
+    // shuffled: the new order, one row dropped
+    let order = ShuffleMergeOrder::for_test(
+        &[3, 2],
+        vec![
+            RowAddr {
+                segment_ord: 1,
+                row_id: 1,
+            },
+            RowAddr {
+                segment_ord: 0,
+                row_id: 2,
+            },
+            RowAddr {
+                segment_ord: 0,
+                row_id: 0,
+            },
+            RowAddr {
+                segment_ord: 1,
+                row_id: 0,
+            },
+        ],
+    );
+    let mut buffer = Vec::new();
+    crate::columnar::merge_columnar_replacing(
+        columnars,
+        &[],
+        order.into(),
+        &[("rank", &value)],
+        &mut buffer,
+    )
+    .unwrap();
+    assert_eq!(read(buffer), vec![101, 2, 0, 100]);
+}
